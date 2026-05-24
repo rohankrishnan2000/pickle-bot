@@ -128,16 +128,41 @@ def _parse_date(raw: str) -> str | None:
     return raw if re.fullmatch(r"\d{2}/\d{2}/\d{4}", raw) else None
 
 
+def _intervention_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Accept shorter", callback_data="iv_accept"),
+         InlineKeyboardButton("⏭ Skip & keep waiting", callback_data="iv_skip")],
+    ])
+
+
 def _make_notifier(app: Application):
-    async def notify(job: snipe_job.SnipeJob, text: str) -> None:
+    async def notify(job: snipe_job.SnipeJob, text: str, markup: str | None = None) -> None:
+        reply_markup = _intervention_keyboard() if markup == "intervention" else None
         try:
-            await app.bot.send_message(chat_id=job.chat_id, text=text)
+            await app.bot.send_message(
+                chat_id=job.chat_id, text=text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN if markup else None,
+            )
         except Exception as e:
             print(f"notify failed for {job.chat_id}: {e}")
         # Drop the job from the live registry once it terminates.
         if job.status in ("booked", "error", "cancelled"):
             REGISTRY.drop(job.chat_id)
     return notify
+
+
+def _make_spawner(app: Application):
+    """Returns a coroutine that starts a follow-up SnipeJob (used for chain_time)."""
+    async def spawn(job: snipe_job.SnipeJob) -> None:
+        if REGISTRY.has_active(job.chat_id):
+            # User started something new in the meantime — don't clobber it.
+            return
+        snipe_job.persist(job)
+        REGISTRY.add(job)
+        notify = _make_notifier(app)
+        job.task = asyncio.create_task(snipe_job.run_snipe(job, notify, _make_spawner(app)))
+    return spawn
 
 
 # ---------- /start, /help ----------
@@ -191,11 +216,14 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "*Account:*\n"
         "`/login your@email.com yourpassword`\n"
         "`/logout`\n\n"
-        "*Snipe* (polls until a slot opens, then books):\n"
+        "*Snipe* `DATE TIME [COUNT] [DURATION] [court] [+CHAIN_TIME]`:\n"
         "`/snipe 05/25/2026 10:00AM`\n"
         "`/snipe 05/25/2026 7:00AM PB 4B`\n"
         "`/snipe 05/25/2026 10:00AM 3` — book 3 courts together\n"
-        "`/snipe 05/25/2026 10:00AM 3 PB` — 3 courts, PB facility only\n\n"
+        "`/snipe 05/25/2026 10:00AM 3 60 PB` — 3 PB courts, 60 min each\n"
+        "`/snipe 05/25/2026 10:00AM 2 90 +11:30AM` — 2 courts 90 min, then chain another snipe at 11:30AM\n"
+        "DURATION must be a multiple of 30 (max 240). If only a shorter time is\n"
+        "available on enough courts, I'll ping you to accept or skip.\n\n"
         "*Direct booking* (book from current availability):\n"
         "`/list 05/25/2026`\n\n"
         "*Your reservations:*\n"
@@ -278,11 +306,33 @@ async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     rest = list(args[2:])
+
+    # Pull off any +HH:MMam/pm chain-time tokens anywhere in the args.
+    chain_time: str | None = None
+    chain_tokens = [t for t in rest if t.startswith("+")]
+    rest = [t for t in rest if not t.startswith("+")]
+    if chain_tokens:
+        if len(chain_tokens) > 1:
+            await update.message.reply_text("Only one +CHAIN_TIME is supported per /snipe.")
+            return
+        ct = _parse_time(chain_tokens[0][1:])
+        if not ct:
+            await update.message.reply_text("Bad +CHAIN_TIME format. Example: +11:30AM")
+            return
+        chain_time = ct
+
+    # Up to two leading numerics: COUNT then DURATION (minutes, multiple of 30).
     count = 1
+    duration_min = 30
     if rest and rest[0].isdigit():
         count = int(rest.pop(0))
         if count < 1 or count > 20:
             await update.message.reply_text("COUNT must be between 1 and 20.")
+            return
+    if rest and rest[0].isdigit():
+        duration_min = int(rest.pop(0))
+        if duration_min < 30 or duration_min > 240 or duration_min % 30 != 0:
+            await update.message.reply_text("DURATION must be 30, 60, 90, 120, ... up to 240.")
             return
 
     court = " ".join(rest).strip() or None
@@ -296,6 +346,7 @@ async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     job = snipe_job.SnipeJob(
         chat_id=chat_id, date=date, target_time=target_time, court=court,
         email=email, password=password, count=count,
+        duration_min=duration_min, chain_time=chain_time,
     )
 
     if count == 1:
@@ -322,7 +373,8 @@ async def _start_snipe(job: snipe_job.SnipeJob, update: Update, ctx: ContextType
     snipe_job.persist(job)
     REGISTRY.add(job)
     notify = _make_notifier(ctx.application)
-    job.task = asyncio.create_task(snipe_job.run_snipe(job, notify))
+    spawn = _make_spawner(ctx.application)
+    job.task = asyncio.create_task(snipe_job.run_snipe(job, notify, spawn))
 
     label = job.court or "any court"
     extras = []
@@ -330,6 +382,10 @@ async def _start_snipe(job: snipe_job.SnipeJob, update: Update, ctx: ContextType
         extras.append(f"{job.count} courts")
         extras.append("partial OK" if job.partial else "wait for full count")
         extras.append("same number required" if job.same_number else "prefer same number")
+    if job.duration_min != 30:
+        extras.append(f"{job.duration_min} min")
+    if job.chain_time:
+        extras.append(f"chain → {job.chain_time}")
     extras_str = f" ({'; '.join(extras)})" if extras else ""
 
     text = (
@@ -368,6 +424,12 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"  • courts wanted: {job.count}")
         lines.append(f"  • partial OK: {'yes' if job.partial else 'no'}")
         lines.append(f"  • same number required: {'yes' if job.same_number else 'no'}")
+    if job.duration_min != 30:
+        lines.append(f"  • duration: {job.duration_min} min")
+    if job.chain_time:
+        lines.append(f"  • chain on success → {job.chain_time}")
+    if job.pending_offer:
+        lines.append("  • ⏸ awaiting your decision on a shorter offer")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -411,7 +473,8 @@ async def resume_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     REGISTRY.add(pending)
 
     notify = _make_notifier(ctx.application)
-    pending.task = asyncio.create_task(snipe_job.run_snipe(pending, notify))
+    spawn = _make_spawner(ctx.application)
+    pending.task = asyncio.create_task(snipe_job.run_snipe(pending, notify, spawn))
     await update.message.reply_text(
         f"Resumed snipe: {pending.target_time} on {pending.date}."
     )
@@ -610,6 +673,16 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     elif data == "cxlabort":
         await query.edit_message_text("Kept the reservation.")
+
+    elif data in ("iv_accept", "iv_skip"):
+        job = REGISTRY.get(chat_id)
+        if not job or not job.intervention_event or job.intervention_event.is_set():
+            await query.edit_message_text("That request is no longer active.")
+            return
+        job.intervention_choice = "accept" if data == "iv_accept" else "skip"
+        job.intervention_event.set()
+        verb = "Accepting the shorter booking..." if data == "iv_accept" else "Skipped. Resuming poll."
+        await query.edit_message_text(verb)
 
     elif data.startswith("cfg_partial:"):
         pending = PENDING_SNIPE.get(chat_id)
