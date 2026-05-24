@@ -24,7 +24,12 @@ load_dotenv()
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 _raw_ids = os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").strip()
-ALLOWED_CHAT_IDS = {int(x) for x in _raw_ids.split(",") if x.strip()}
+ALLOWED_CHAT_IDS: set[int] = {int(x) for x in _raw_ids.split(",") if x.strip()}
+_admin_raw = os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "").strip()
+ADMIN_CHAT_ID: int | None = int(_admin_raw) if _admin_raw else None
+
+# chat_id -> {"name": str, "ts": float} — users awaiting admin decision (in-memory; resets on restart)
+PENDING_APPROVALS: dict[int, dict] = {}
 
 REGISTRY = snipe_job.JobRegistry()
 
@@ -47,11 +52,63 @@ def _allowed(update: Update) -> bool:
     return chat.id in ALLOWED_CHAT_IDS
 
 
-async def _deny(update: Update) -> None:
-    if update.message:
+async def _deny(update: Update, ctx: ContextTypes.DEFAULT_TYPE | None = None) -> None:
+    """For messages: forward to admin as access request. For callbacks: silent reject."""
+    if update.message and ctx is not None:
+        await _request_access(update, ctx)
+    elif update.message:
         await update.message.reply_text("Not authorized.")
     elif update.callback_query:
         await update.callback_query.answer("Not authorized.", show_alert=True)
+
+
+def _display_name(update: Update) -> str:
+    user = update.effective_user
+    if not user:
+        return "?"
+    parts = [user.first_name or "", user.last_name or ""]
+    name = " ".join(p for p in parts if p).strip()
+    if user.username:
+        name = f"{name} (@{user.username})" if name else f"@{user.username}"
+    return name or str(user.id)
+
+
+async def _request_access(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Called when an unauthorized user messages the bot. Forwards request to admin."""
+    if not update.message or not update.effective_chat:
+        return
+
+    chat_id = update.effective_chat.id
+    name = _display_name(update)
+
+    if chat_id in PENDING_APPROVALS:
+        await update.message.reply_text("Your access request is still pending. The admin will let you in soon.")
+        return
+
+    if ADMIN_CHAT_ID is None:
+        await update.message.reply_text(
+            f"Not authorized. Your chat_id is `{chat_id}`. Ask the admin to add it.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    PENDING_APPROVALS[chat_id] = {"name": name, "ts": time.time()}
+    await update.message.reply_text(
+        "Access request sent to the admin. You'll get a message when you're approved."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Approve", callback_data=f"approve:{chat_id}"),
+         InlineKeyboardButton("❌ Deny", callback_data=f"deny:{chat_id}")],
+    ])
+    try:
+        await ctx.application.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"🔑 Access request from *{name}*\nchat_id: `{chat_id}`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb,
+        )
+    except Exception as e:
+        print(f"could not notify admin {ADMIN_CHAT_ID}: {e}")
 
 
 def _parse_time(raw: str) -> str | None:
@@ -82,13 +139,8 @@ def _make_notifier(app: Application):
 # ---------- /start, /help ----------
 
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
     if not _allowed(update):
-        await update.message.reply_text(
-            f"Not authorized. Your chat_id is `{chat_id}`. "
-            f"Add it to TELEGRAM_ALLOWED_CHAT_IDS in .env to enable.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await _request_access(update, ctx)
         return
     creds = snipe_job.get_credentials(update.effective_chat.id)
     if not creds:
@@ -130,7 +182,7 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
-        await _deny(update); return
+        await _deny(update, ctx); return
     await update.message.reply_text(
         "*Account:*\n"
         "`/login your@email.com yourpassword`\n"
@@ -151,7 +203,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def login_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
-        await _deny(update); return
+        await _deny(update, ctx); return
 
     args = ctx.args
     if len(args) < 2:
@@ -175,7 +227,7 @@ async def login_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def logout_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
-        await _deny(update); return
+        await _deny(update, ctx); return
 
     chat_id = update.effective_chat.id
     if REGISTRY.has_active(chat_id):
@@ -190,7 +242,7 @@ async def logout_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
-        await _deny(update); return
+        await _deny(update, ctx); return
 
     chat_id = update.effective_chat.id
 
@@ -248,7 +300,7 @@ async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
-        await _deny(update); return
+        await _deny(update, ctx); return
 
     chat_id = update.effective_chat.id
     job = REGISTRY.get(chat_id)
@@ -272,7 +324,7 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
-        await _deny(update); return
+        await _deny(update, ctx); return
 
     chat_id = update.effective_chat.id
     job = REGISTRY.get(chat_id)
@@ -289,7 +341,7 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def resume_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
-        await _deny(update); return
+        await _deny(update, ctx); return
 
     chat_id = update.effective_chat.id
     pending = PENDING_RESUME.pop(chat_id, None)
@@ -318,7 +370,7 @@ async def resume_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
-        await _deny(update); return
+        await _deny(update, ctx); return
 
     args = ctx.args
     if not args:
@@ -379,7 +431,7 @@ async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def bookings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
-        await _deny(update); return
+        await _deny(update, ctx); return
 
     chat_id = update.effective_chat.id
     creds = snipe_job.get_credentials(chat_id)
@@ -429,7 +481,7 @@ async def bookings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
-        await _deny(update); return
+        await _deny(update, ctx); return
 
     query = update.callback_query
     await query.answer()
@@ -508,11 +560,46 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     elif data == "cxlabort":
         await query.edit_message_text("Kept the reservation.")
 
+    elif data.startswith("approve:") or data.startswith("deny:"):
+        if chat_id != ADMIN_CHAT_ID:
+            await query.answer("Only the admin can do that.", show_alert=True)
+            return
+        action, _, target_raw = data.partition(":")
+        target_id = int(target_raw)
+        pending = PENDING_APPROVALS.pop(target_id, None)
+        name = pending["name"] if pending else str(target_id)
+
+        if action == "approve":
+            snipe_job.add_allowed_user(target_id, name)
+            ALLOWED_CHAT_IDS.add(target_id)
+            await query.edit_message_text(f"✅ Approved {name} ({target_id}).")
+            try:
+                await ctx.application.bot.send_message(
+                    chat_id=target_id,
+                    text="✅ You're approved! Send /login your@email.com yourpassword to connect your yourcourts account, then try /start.",
+                )
+            except Exception as e:
+                print(f"could not notify approved user {target_id}: {e}")
+        else:
+            await query.edit_message_text(f"❌ Denied {name} ({target_id}).")
+            try:
+                await ctx.application.bot.send_message(
+                    chat_id=target_id, text="Your access request was denied."
+                )
+            except Exception as e:
+                print(f"could not notify denied user {target_id}: {e}")
+
 
 # ---------- Startup ----------
 
 async def post_init(app: Application) -> None:
-    """Called once the application is set up. Surface interrupted snipes."""
+    """Called once the application is set up. Load allowlist + surface interrupted snipes."""
+    for cid in snipe_job.load_allowed_users():
+        ALLOWED_CHAT_IDS.add(cid)
+    if ADMIN_CHAT_ID is not None:
+        ALLOWED_CHAT_IDS.add(ADMIN_CHAT_ID)
+    print(f"Allowed chat_ids ({len(ALLOWED_CHAT_IDS)}):", ALLOWED_CHAT_IDS)
+
     interrupted = snipe_job.mark_all_interrupted()
     notify = _make_notifier(app)
     for job in interrupted:
@@ -533,8 +620,8 @@ async def post_init(app: Application) -> None:
 def main() -> None:
     if not TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN not set in .env")
-    if not ALLOWED_CHAT_IDS:
-        raise SystemExit("TELEGRAM_ALLOWED_CHAT_IDS empty — add your chat_id to .env")
+    if not ALLOWED_CHAT_IDS and ADMIN_CHAT_ID is None:
+        raise SystemExit("Set TELEGRAM_ADMIN_CHAT_ID (or TELEGRAM_ALLOWED_CHAT_IDS) in .env")
 
     app = (
         ApplicationBuilder()

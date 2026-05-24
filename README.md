@@ -19,12 +19,11 @@ Two modes:
 
 4. Copy `.env.example` to `.env` and fill it in:
    ```
-   YC_EMAIL=your-yourcourts-email
-   YC_PASSWORD=your-yourcourts-password
    TELEGRAM_BOT_TOKEN=...
-   TELEGRAM_ALLOWED_CHAT_IDS=123456789
+   TELEGRAM_ADMIN_CHAT_ID=123456789
    ```
-   Comma-separate `TELEGRAM_ALLOWED_CHAT_IDS` to allow multiple users.
+   When a new user messages the bot, you'll get a DM with Approve/Deny buttons.
+   Approved chat_ids are persisted in SQLite.
 
 5. Start the bot:
    ```

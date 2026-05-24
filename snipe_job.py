@@ -60,8 +60,39 @@ def _db() -> sqlite3.Connection:
             password TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS allowed_users (
+            chat_id INTEGER PRIMARY KEY,
+            display_name TEXT,
+            approved_at REAL NOT NULL
+        )
+    """)
     conn.commit()
     return conn
+
+
+def add_allowed_user(chat_id: int, display_name: str | None) -> None:
+    conn = _db()
+    conn.execute(
+        "INSERT OR IGNORE INTO allowed_users (chat_id, display_name, approved_at) VALUES (?, ?, ?)",
+        (chat_id, display_name, time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_allowed_user(chat_id: int) -> None:
+    conn = _db()
+    conn.execute("DELETE FROM allowed_users WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+
+def load_allowed_users() -> list[int]:
+    conn = _db()
+    rows = conn.execute("SELECT chat_id FROM allowed_users").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
 
 
 def save_credentials(chat_id: int, email: str, password: str) -> None:
