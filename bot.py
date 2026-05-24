@@ -87,6 +87,19 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.MARKDOWN,
         )
         return
+    creds = snipe_job.get_credentials(update.effective_chat.id)
+    if not creds:
+        await update.message.reply_text(
+            "🎾 *Court bot ready.*\n\n"
+            "First, connect your yourcourts.com account:\n"
+            "`/login your@email.com yourpassword`\n\n"
+            "Then you can:\n"
+            "`/snipe 05/25/2026 10:00AM` — auto-book when slot opens\n"
+            "`/list 05/25/2026` — see & tap-to-book current openings\n\n"
+            "/help for full reference.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
     await update.message.reply_text(
         "🎾 *Court bot ready.*\n\n"
         "I do two things:\n"
@@ -114,6 +127,9 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
         await _deny(update); return
     await update.message.reply_text(
+        "*Account:*\n"
+        "`/login your@email.com yourpassword`\n"
+        "`/logout`\n\n"
         "*Snipe* (polls until a slot opens, then books):\n"
         "`/snipe 05/25/2026 10:00AM`\n"
         "`/snipe 05/25/2026 7:00AM PB 4B`\n\n"
@@ -122,6 +138,45 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "One active snipe per user. Use /cancel to stop it before starting another.",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+# ---------- /login, /logout ----------
+
+async def login_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed(update):
+        await _deny(update); return
+
+    args = ctx.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /login your@email.com yourpassword")
+        return
+
+    email, password = args[0], args[1]
+    await update.message.reply_text("Checking credentials...")
+
+    session = yourcourts.make_session()
+    ok = await asyncio.to_thread(yourcourts.login, session, email, password)
+    if not ok:
+        await update.message.reply_text("❌ Login failed — double-check your email and password.")
+        return
+
+    snipe_job.save_credentials(update.effective_chat.id, email, password)
+    await update.message.reply_text(
+        f"✅ Logged in as {email}. You're good to go — try /snipe or /list."
+    )
+
+
+async def logout_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed(update):
+        await _deny(update); return
+
+    chat_id = update.effective_chat.id
+    if REGISTRY.has_active(chat_id):
+        await update.message.reply_text("You have an active snipe — /cancel it first.")
+        return
+
+    snipe_job.delete_credentials(chat_id)
+    await update.message.reply_text("Credentials removed.")
 
 
 # ---------- /snipe ----------
@@ -159,8 +214,15 @@ async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     court = " ".join(args[2:]).strip() or None
 
+    creds = snipe_job.get_credentials(chat_id)
+    if not creds:
+        await update.message.reply_text("No account connected. Run /login first.")
+        return
+    email, password = creds
+
     job = snipe_job.SnipeJob(
-        chat_id=chat_id, date=date, target_time=target_time, court=court
+        chat_id=chat_id, date=date, target_time=target_time, court=court,
+        email=email, password=password,
     )
     snipe_job.persist(job)
     REGISTRY.add(job)
@@ -260,12 +322,18 @@ async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Bad date format. Use MM/DD/YYYY.")
         return
 
+    creds = snipe_job.get_credentials(update.effective_chat.id)
+    if not creds:
+        await update.message.reply_text("No account connected. Run /login first.")
+        return
+    email, password = creds
+
     await update.message.reply_text(f"Fetching openings for {date}...")
 
     session = yourcourts.make_session()
-    ok = await asyncio.to_thread(yourcourts.login, session)
+    ok = await asyncio.to_thread(yourcourts.login, session, email, password)
     if not ok:
-        await update.message.reply_text("Login to yourcourts.com failed.")
+        await update.message.reply_text("Login to yourcourts.com failed — try /login again.")
         return
 
     slots = await asyncio.to_thread(yourcourts.find_slots, session, date)
@@ -384,6 +452,8 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("login", login_cmd))
+    app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CommandHandler("snipe", snipe_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))

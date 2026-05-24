@@ -24,6 +24,8 @@ class SnipeJob:
     date: str
     target_time: str
     court: Optional[str]
+    email: str = ""
+    password: str = ""
     status: str = "running"  # running | booked | cancelled | error | interrupted
     attempts: int = 0
     started_at: float = field(default_factory=time.time)
@@ -43,33 +45,73 @@ def _db() -> sqlite3.Connection:
             date TEXT NOT NULL,
             target_time TEXT NOT NULL,
             court TEXT,
+            email TEXT NOT NULL DEFAULT '',
+            password TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
             started_at REAL NOT NULL,
             last_message TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id INTEGER PRIMARY KEY,
+            email TEXT NOT NULL,
+            password TEXT NOT NULL
+        )
+    """)
     conn.commit()
     return conn
+
+
+def save_credentials(chat_id: int, email: str, password: str) -> None:
+    conn = _db()
+    conn.execute(
+        """
+        INSERT INTO users (chat_id, email, password) VALUES (?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET email=excluded.email, password=excluded.password
+        """,
+        (chat_id, email, password),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_credentials(chat_id: int) -> tuple[str, str] | None:
+    conn = _db()
+    row = conn.execute(
+        "SELECT email, password FROM users WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    conn.close()
+    return (row[0], row[1]) if row else None
+
+
+def delete_credentials(chat_id: int) -> None:
+    conn = _db()
+    conn.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
 
 
 def persist(job: SnipeJob) -> None:
     conn = _db()
     conn.execute(
         """
-        INSERT INTO jobs (chat_id, date, target_time, court, status, attempts, started_at, last_message)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO jobs (chat_id, date, target_time, court, email, password, status, attempts, started_at, last_message)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chat_id) DO UPDATE SET
             date=excluded.date,
             target_time=excluded.target_time,
             court=excluded.court,
+            email=excluded.email,
+            password=excluded.password,
             status=excluded.status,
             attempts=excluded.attempts,
             started_at=excluded.started_at,
             last_message=excluded.last_message
         """,
-        (job.chat_id, job.date, job.target_time, job.court, job.status,
-         job.attempts, job.started_at, job.last_message),
+        (job.chat_id, job.date, job.target_time, job.court, job.email, job.password,
+         job.status, job.attempts, job.started_at, job.last_message),
     )
     conn.commit()
     conn.close()
@@ -85,14 +127,15 @@ def remove(chat_id: int) -> None:
 def load_persisted() -> list[SnipeJob]:
     conn = _db()
     rows = conn.execute(
-        "SELECT chat_id, date, target_time, court, status, attempts, started_at, last_message FROM jobs"
+        "SELECT chat_id, date, target_time, court, email, password, status, attempts, started_at, last_message FROM jobs"
     ).fetchall()
     conn.close()
     jobs = []
     for r in rows:
         jobs.append(SnipeJob(
             chat_id=r[0], date=r[1], target_time=r[2], court=r[3],
-            status=r[4], attempts=r[5], started_at=r[6], last_message=r[7] or "",
+            email=r[4] or "", password=r[5] or "",
+            status=r[6], attempts=r[7], started_at=r[8], last_message=r[9] or "",
         ))
     return jobs
 
@@ -129,8 +172,8 @@ class JobRegistry:
         return list(self._jobs.values())
 
 
-async def _do_login(session: requests.Session) -> bool:
-    return await asyncio.to_thread(yourcourts.login, session)
+async def _do_login(session: requests.Session, email: str = "", password: str = "") -> bool:
+    return await asyncio.to_thread(yourcourts.login, session, email or None, password or None)
 
 
 async def _find(session, date, target_time, court):
@@ -146,7 +189,7 @@ async def run_snipe(job: SnipeJob, notify: NotifyCb) -> None:
     job.session = yourcourts.make_session()
 
     try:
-        if not await _do_login(job.session):
+        if not await _do_login(job.session, job.email, job.password):
             job.status = "error"
             job.last_message = "Login to yourcourts.com failed"
             persist(job)
@@ -167,7 +210,7 @@ async def run_snipe(job: SnipeJob, notify: NotifyCb) -> None:
 
             if not matches:
                 if job.attempts % REFRESH_LOGIN_EVERY == 0:
-                    await _do_login(job.session)
+                    await _do_login(job.session, job.email, job.password)
                 persist(job)
                 await asyncio.sleep(POLL_INTERVAL)
                 continue

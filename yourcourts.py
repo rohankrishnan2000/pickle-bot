@@ -62,13 +62,15 @@ def make_session() -> requests.Session:
     return session
 
 
-def login(session: requests.Session) -> bool:
-    if not EMAIL or not PASSWORD:
-        raise RuntimeError("YC_EMAIL / YC_PASSWORD not set in environment")
+def login(session: requests.Session, email: str | None = None, password: str | None = None) -> bool:
+    email = email or EMAIL
+    password = password or PASSWORD
+    if not email or not password:
+        raise RuntimeError("No credentials provided and YC_EMAIL/YC_PASSWORD not set in environment")
     session.get(f"{BASE_URL}/login")
     resp = session.post(
         f"{BASE_URL}/security/login/form-login",
-        data={"username": EMAIL, "password": PASSWORD, "rememberMe": "on"},
+        data={"username": email, "password": password, "rememberMe": "on"},
         allow_redirects=True,
     )
     return "showLogin" not in resp.url
