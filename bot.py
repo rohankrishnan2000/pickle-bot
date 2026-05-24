@@ -34,6 +34,9 @@ REGISTRY = snipe_job.JobRegistry()
 LIST_CACHE: dict[int, dict] = {}  # chat_id -> {"date": str, "slots": list[dict], "ts": float}
 LIST_CACHE_TTL = 600  # seconds
 
+BOOKINGS_CACHE: dict[int, dict] = {}  # chat_id -> {"bookings": list[dict], "ts": float, "session": Session}
+BOOKINGS_CACHE_TTL = 600  # seconds
+
 PENDING_RESUME: dict[int, snipe_job.SnipeJob] = {}  # chat_id -> interrupted job awaiting /resume
 
 
@@ -111,7 +114,9 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "`/snipe 05/25/2026 7:00AM PB 4B`\n"
         "  → only takes that exact court\n"
         "`/list 05/25/2026`\n"
-        "  → shows all openings as tap-to-book buttons\n\n"
+        "  → shows all openings as tap-to-book buttons\n"
+        "`/bookings`\n"
+        "  → list your upcoming reservations; tap to cancel\n\n"
         "*Managing a running snipe:*\n"
         "/status — see how it's going\n"
         "/cancel — stop it\n"
@@ -135,6 +140,8 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "`/snipe 05/25/2026 7:00AM PB 4B`\n\n"
         "*Direct booking* (book from current availability):\n"
         "`/list 05/25/2026`\n\n"
+        "*Your reservations:*\n"
+        "`/bookings` — list your upcoming reservations; tap to cancel\n\n"
         "One active snipe per user. Use /cancel to stop it before starting another.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -368,6 +375,56 @@ async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+# ---------- /bookings (list + cancel my reservations) ----------
+
+async def bookings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed(update):
+        await _deny(update); return
+
+    chat_id = update.effective_chat.id
+    creds = snipe_job.get_credentials(chat_id)
+    if not creds:
+        await update.message.reply_text("No account connected. Run /login first.")
+        return
+    email, password = creds
+
+    await update.message.reply_text("Fetching your reservations...")
+
+    session = yourcourts.make_session()
+    ok = await asyncio.to_thread(yourcourts.login, session, email, password)
+    if not ok:
+        await update.message.reply_text("Login to yourcourts.com failed — try /login again.")
+        return
+
+    try:
+        bookings = await asyncio.to_thread(yourcourts.list_my_bookings, session)
+    except Exception as e:
+        await update.message.reply_text(f"Could not load bookings: {e}")
+        return
+
+    upcoming = [b for b in bookings if not b["is_past"]]
+    if not upcoming:
+        await update.message.reply_text("You have no upcoming reservations.")
+        return
+
+    BOOKINGS_CACHE[chat_id] = {"bookings": upcoming, "ts": time.time(), "session": session}
+
+    upcoming.sort(key=lambda b: b["start"])
+    rows: list[list[InlineKeyboardButton]] = []
+    summary_lines = []
+    for i, b in enumerate(upcoming):
+        start_dt = b["start"][:16].replace("-", "/")  # 2026/05/25 10:30
+        label = f"❌ {start_dt} — {b['court']} ({b['times']})"
+        rows.append([InlineKeyboardButton(label, callback_data=f"cxlpick:{i}")])
+        summary_lines.append(f"• {start_dt} — {b['court']} ({b['times']})")
+
+    await update.message.reply_text(
+        f"Your {len(upcoming)} upcoming reservation(s):\n" + "\n".join(summary_lines) +
+        "\n\nTap one below to cancel.",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
 # ---------- Callback queries (book confirmation flow) ----------
 
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -415,6 +472,42 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     elif data == "abort":
         await query.edit_message_text("Cancelled.")
 
+    elif data.startswith("cxlpick:"):
+        idx = int(data.split(":", 1)[1])
+        cache = BOOKINGS_CACHE.get(chat_id)
+        if not cache or time.time() - cache["ts"] > BOOKINGS_CACHE_TTL:
+            await query.edit_message_text("This list expired. Run /bookings again.")
+            return
+        if idx >= len(cache["bookings"]):
+            await query.edit_message_text("Reservation not found. Run /bookings again.")
+            return
+        b = cache["bookings"][idx]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, cancel it", callback_data=f"cxlconfirm:{idx}"),
+             InlineKeyboardButton("✖ Keep it", callback_data="cxlabort")],
+        ])
+        await query.edit_message_text(
+            f"Cancel *{b['court']}* on *{b['start'][:10]}* ({b['times']})?",
+            reply_markup=kb,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    elif data.startswith("cxlconfirm:"):
+        idx = int(data.split(":", 1)[1])
+        cache = BOOKINGS_CACHE.get(chat_id)
+        if not cache or time.time() - cache["ts"] > BOOKINGS_CACHE_TTL:
+            await query.edit_message_text("This list expired. Run /bookings again.")
+            return
+        b = cache["bookings"][idx]
+        await query.edit_message_text(f"Cancelling {b['court']} on {b['start'][:10]}...")
+        ok, msg = await asyncio.to_thread(
+            yourcourts.cancel_reservation, cache["session"], b["id"]
+        )
+        await query.edit_message_text(("✅ " if ok else "❌ ") + msg)
+
+    elif data == "cxlabort":
+        await query.edit_message_text("Kept the reservation.")
+
 
 # ---------- Startup ----------
 
@@ -460,6 +553,7 @@ def main() -> None:
     app.add_handler(CommandHandler("resume", resume_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("book", list_cmd))
+    app.add_handler(CommandHandler("bookings", bookings_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     print("Bot starting. Allowed chat_ids:", ALLOWED_CHAT_IDS)

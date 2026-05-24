@@ -2,6 +2,7 @@
 
 import os
 import re
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -167,3 +168,57 @@ def book_slot(session: requests.Session, slot: dict, date: str) -> tuple[bool, s
         if clean:
             return False, clean
     return False, f"Booking failed (status {resp.status_code})"
+
+
+def list_my_bookings(session: requests.Session, days_ahead: int = 30) -> list[dict]:
+    """Fetch the current user's upcoming reservations via the calendar JSON endpoint."""
+    now = datetime.now().astimezone()
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=days_ahead)
+
+    resp = session.get(
+        f"{BASE_URL}/facility/getevents",
+        params={
+            "thisMemberOnly": "true",
+            "facility_id": "",
+            "readOnlyViewer": "false",
+            "start": start.isoformat(timespec="seconds"),
+            "end": end.isoformat(timespec="seconds"),
+        },
+        headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
+    )
+    resp.raise_for_status()
+    events = resp.json() or []
+    return [{
+        "id": e["id"],
+        "court": e.get("resourceName", "?"),
+        "times": e.get("eventTimes", "?"),
+        "start": e.get("start", ""),
+        "event_type": e.get("eventType", ""),
+        "is_past": bool(e.get("isPast", False)),
+    } for e in events if e.get("id")]
+
+
+def cancel_reservation(session: requests.Session, reservation_id: str) -> tuple[bool, str]:
+    """Cancel a reservation. Returns (success, message)."""
+    preview = session.get(f"{BASE_URL}/reservation/previewCancelReservation/{reservation_id}",
+                          params={"facility_id": ""})
+    if preview.status_code != 200:
+        return False, f"Could not load cancel page (status {preview.status_code})"
+
+    resp = session.post(
+        f"{BASE_URL}/reservation/cancelReservation",
+        data={
+            "id": str(reservation_id),
+            "facility_id": "",
+            "reservationCancellationTypeId": "5",
+        },
+        headers={
+            "Origin": BASE_URL,
+            "Referer": f"{BASE_URL}/reservation/previewCancelReservation/{reservation_id}?facility_id=",
+        },
+        allow_redirects=False,
+    )
+    if resp.status_code == 302:
+        return True, f"Cancelled reservation {reservation_id}"
+    return False, f"Cancel failed (status {resp.status_code})"
