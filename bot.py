@@ -44,6 +44,10 @@ BOOKINGS_CACHE_TTL = 600  # seconds
 
 PENDING_RESUME: dict[int, snipe_job.SnipeJob] = {}  # chat_id -> interrupted job awaiting /resume
 
+# chat_id -> partially-configured SnipeJob awaiting follow-up answers (count, partial, same_number).
+PENDING_SNIPE: dict[int, snipe_job.SnipeJob] = {}
+PENDING_SNIPE_TTL = 300
+
 
 def _allowed(update: Update) -> bool:
     chat = update.effective_chat
@@ -189,7 +193,9 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "`/logout`\n\n"
         "*Snipe* (polls until a slot opens, then books):\n"
         "`/snipe 05/25/2026 10:00AM`\n"
-        "`/snipe 05/25/2026 7:00AM PB 4B`\n\n"
+        "`/snipe 05/25/2026 7:00AM PB 4B`\n"
+        "`/snipe 05/25/2026 10:00AM 3` — book 3 courts together\n"
+        "`/snipe 05/25/2026 10:00AM 3 PB` — 3 courts, PB facility only\n\n"
         "*Direct booking* (book from current availability):\n"
         "`/list 05/25/2026`\n\n"
         "*Your reservations:*\n"
@@ -257,7 +263,7 @@ async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args = ctx.args
     if len(args) < 2:
         await update.message.reply_text(
-            "Usage: /snipe MM/DD/YYYY H:MMam/pm [court name]"
+            "Usage: /snipe MM/DD/YYYY H:MMam/pm [COUNT] [court name]"
         )
         return
 
@@ -271,7 +277,15 @@ async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Bad time format. Use H:MMam or H:MMpm.")
         return
 
-    court = " ".join(args[2:]).strip() or None
+    rest = list(args[2:])
+    count = 1
+    if rest and rest[0].isdigit():
+        count = int(rest.pop(0))
+        if count < 1 or count > 20:
+            await update.message.reply_text("COUNT must be between 1 and 20.")
+            return
+
+    court = " ".join(rest).strip() or None
 
     creds = snipe_job.get_credentials(chat_id)
     if not creds:
@@ -281,19 +295,51 @@ async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     job = snipe_job.SnipeJob(
         chat_id=chat_id, date=date, target_time=target_time, court=court,
-        email=email, password=password,
+        email=email, password=password, count=count,
     )
+
+    if count == 1:
+        await _start_snipe(job, update, ctx)
+        return
+
+    # Multi-court: ask follow-up questions before starting.
+    PENDING_SNIPE[chat_id] = job
+    job.started_at = time.time()  # used to expire the pending config
+    label = court or "any court"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Yes, book what's available", callback_data="cfg_partial:1"),
+         InlineKeyboardButton("No, wait for all", callback_data="cfg_partial:0")],
+    ])
+    await update.message.reply_text(
+        f"Setting up a snipe for *{count}* courts at *{target_time}* on *{date}* ({label}).\n\n"
+        f"If fewer than {count} courts open up, should I still book what's available?",
+        reply_markup=kb,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def _start_snipe(job: snipe_job.SnipeJob, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     snipe_job.persist(job)
     REGISTRY.add(job)
-
     notify = _make_notifier(ctx.application)
     job.task = asyncio.create_task(snipe_job.run_snipe(job, notify))
 
-    label = court or "any court"
-    await update.message.reply_text(
-        f"🎯 Sniping started: {target_time} on {date} ({label}).\n"
+    label = job.court or "any court"
+    extras = []
+    if job.count > 1:
+        extras.append(f"{job.count} courts")
+        extras.append("partial OK" if job.partial else "wait for full count")
+        extras.append("same number required" if job.same_number else "prefer same number")
+    extras_str = f" ({'; '.join(extras)})" if extras else ""
+
+    text = (
+        f"🎯 Sniping started: {job.target_time} on {job.date} ({label}){extras_str}.\n"
         f"You'll get a ping when something opens up or it's booked."
     )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text)
+    else:
+        await update.message.reply_text(text)
 
 
 # ---------- /status ----------
@@ -311,13 +357,18 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     runtime = int(time.time() - job.started_at)
     mins, secs = divmod(runtime, 60)
     label = job.court or "any court"
-    await update.message.reply_text(
-        f"Active snipe:\n"
-        f"  • {job.target_time} on {job.date} ({label})\n"
-        f"  • status: {job.status}\n"
-        f"  • attempts: {job.attempts}\n"
-        f"  • runtime: {mins}m {secs}s"
-    )
+    lines = [
+        "Active snipe:",
+        f"  • {job.target_time} on {job.date} ({label})",
+        f"  • status: {job.status}",
+        f"  • attempts: {job.attempts}",
+        f"  • runtime: {mins}m {secs}s",
+    ]
+    if job.count > 1:
+        lines.append(f"  • courts wanted: {job.count}")
+        lines.append(f"  • partial OK: {'yes' if job.partial else 'no'}")
+        lines.append(f"  • same number required: {'yes' if job.same_number else 'no'}")
+    await update.message.reply_text("\n".join(lines))
 
 
 # ---------- /cancel ----------
@@ -559,6 +610,37 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     elif data == "cxlabort":
         await query.edit_message_text("Kept the reservation.")
+
+    elif data.startswith("cfg_partial:"):
+        pending = PENDING_SNIPE.get(chat_id)
+        if not pending or time.time() - pending.started_at > PENDING_SNIPE_TTL:
+            PENDING_SNIPE.pop(chat_id, None)
+            await query.edit_message_text("This setup expired. Run /snipe again.")
+            return
+        pending.partial = data.endswith(":1")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Yes, same number only", callback_data="cfg_same:1"),
+             InlineKeyboardButton("No, just keep them close", callback_data="cfg_same:0")],
+        ])
+        await query.edit_message_text(
+            f"Partial booking: *{'yes' if pending.partial else 'no'}*.\n\n"
+            f"Should all {pending.count} courts share the same court number "
+            f"(e.g. all PB 4)? If no, I'll just pick courts that sort close together.",
+            reply_markup=kb,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    elif data.startswith("cfg_same:"):
+        pending = PENDING_SNIPE.pop(chat_id, None)
+        if not pending or time.time() - pending.started_at > PENDING_SNIPE_TTL:
+            await query.edit_message_text("This setup expired. Run /snipe again.")
+            return
+        if REGISTRY.has_active(chat_id):
+            await query.edit_message_text("You already have an active snipe. /cancel it first.")
+            return
+        pending.same_number = data.endswith(":1")
+        pending.started_at = time.time()
+        await _start_snipe(pending, update, ctx)
 
     elif data.startswith("approve:") or data.startswith("deny:"):
         if chat_id != ADMIN_CHAT_ID:

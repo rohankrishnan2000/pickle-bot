@@ -1,9 +1,11 @@
 """Async snipe job management. One active job per chat_id; SQLite-mirrored state."""
 
 import asyncio
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from itertools import groupby
 from typing import Awaitable, Callable, Optional
 
 import requests
@@ -30,6 +32,9 @@ class SnipeJob:
     attempts: int = 0
     started_at: float = field(default_factory=time.time)
     last_message: str = ""
+    count: int = 1
+    partial: bool = False           # if True, accept fewer than `count` courts
+    same_number: bool = False       # if True, all booked courts must share the same court number
     task: Optional[asyncio.Task] = None
     session: Optional[requests.Session] = None
 
@@ -50,9 +55,21 @@ def _db() -> sqlite3.Connection:
             status TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
             started_at REAL NOT NULL,
-            last_message TEXT
+            last_message TEXT,
+            count INTEGER NOT NULL DEFAULT 1,
+            partial INTEGER NOT NULL DEFAULT 0,
+            same_number INTEGER NOT NULL DEFAULT 0
         )
     """)
+    for col, ddl in (
+        ("count", "ALTER TABLE jobs ADD COLUMN count INTEGER NOT NULL DEFAULT 1"),
+        ("partial", "ALTER TABLE jobs ADD COLUMN partial INTEGER NOT NULL DEFAULT 0"),
+        ("same_number", "ALTER TABLE jobs ADD COLUMN same_number INTEGER NOT NULL DEFAULT 0"),
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             chat_id INTEGER PRIMARY KEY,
@@ -128,8 +145,8 @@ def persist(job: SnipeJob) -> None:
     conn = _db()
     conn.execute(
         """
-        INSERT INTO jobs (chat_id, date, target_time, court, email, password, status, attempts, started_at, last_message)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO jobs (chat_id, date, target_time, court, email, password, status, attempts, started_at, last_message, count, partial, same_number)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chat_id) DO UPDATE SET
             date=excluded.date,
             target_time=excluded.target_time,
@@ -139,10 +156,14 @@ def persist(job: SnipeJob) -> None:
             status=excluded.status,
             attempts=excluded.attempts,
             started_at=excluded.started_at,
-            last_message=excluded.last_message
+            last_message=excluded.last_message,
+            count=excluded.count,
+            partial=excluded.partial,
+            same_number=excluded.same_number
         """,
         (job.chat_id, job.date, job.target_time, job.court, job.email, job.password,
-         job.status, job.attempts, job.started_at, job.last_message),
+         job.status, job.attempts, job.started_at, job.last_message,
+         job.count, int(job.partial), int(job.same_number)),
     )
     conn.commit()
     conn.close()
@@ -158,7 +179,7 @@ def remove(chat_id: int) -> None:
 def load_persisted() -> list[SnipeJob]:
     conn = _db()
     rows = conn.execute(
-        "SELECT chat_id, date, target_time, court, email, password, status, attempts, started_at, last_message FROM jobs"
+        "SELECT chat_id, date, target_time, court, email, password, status, attempts, started_at, last_message, count, partial, same_number FROM jobs"
     ).fetchall()
     conn.close()
     jobs = []
@@ -167,6 +188,7 @@ def load_persisted() -> list[SnipeJob]:
             chat_id=r[0], date=r[1], target_time=r[2], court=r[3],
             email=r[4] or "", password=r[5] or "",
             status=r[6], attempts=r[7], started_at=r[8], last_message=r[9] or "",
+            count=r[10] or 1, partial=bool(r[11]), same_number=bool(r[12]),
         ))
     return jobs
 
@@ -203,12 +225,73 @@ class JobRegistry:
         return list(self._jobs.values())
 
 
+_COURT_RE = re.compile(r"^(.*?)\s*(\d+)\s*([A-Za-z]*)\s*$")
+
+
+def _court_key(name: str) -> tuple[str, int, str]:
+    """Parse 'PB 4B' -> ('PB', 4, 'B'). Falls back gracefully for odd names."""
+    m = _COURT_RE.match(name.strip())
+    if not m:
+        return (name.strip(), 0, "")
+    return (m.group(1).strip(), int(m.group(2)), m.group(3).upper())
+
+
+def pick_group(
+    matches: list[dict],
+    count: int,
+    same_number: bool,
+    partial: bool,
+) -> list[dict] | None:
+    """Choose which slots to book given availability and the user's preferences.
+
+    Strategy: prefer a group of `count` courts that share the same court number;
+    otherwise fall back to the consecutive sorted window. Returns None if nothing
+    satisfies the constraints.
+    """
+    if not matches:
+        return None
+
+    sorted_slots = sorted(matches, key=lambda s: _court_key(s["court"]))
+
+    # Group by (facility, number); each group is a same-number cluster.
+    same_num_groups = [
+        list(g) for _, g in groupby(sorted_slots, key=lambda s: _court_key(s["court"])[:2])
+    ]
+    same_num_groups.sort(key=len, reverse=True)
+
+    full = next((g for g in same_num_groups if len(g) >= count), None)
+    if full:
+        return full[:count]
+
+    if same_number:
+        # Must share court number. Only partial-OK can salvage this.
+        if partial and same_num_groups:
+            return same_num_groups[0]
+        return None
+
+    # No same-number group is large enough; fall back to closest sorted window.
+    if len(sorted_slots) >= count:
+        return sorted_slots[:count]
+    if partial:
+        return sorted_slots
+    return None
+
+
 async def _do_login(session: requests.Session, email: str = "", password: str = "") -> bool:
     return await asyncio.to_thread(yourcourts.login, session, email or None, password or None)
 
 
 async def _find(session, date, target_time, court):
     return await asyncio.to_thread(yourcourts.find_slots, session, date, target_time, court)
+
+
+def _filter_by_court_prefix(matches: list[dict], court_filter: Optional[str]) -> list[dict]:
+    """For multi-court jobs, treat the court arg as a prefix so a partial filter
+    like 'PB' or 'PB 4' still allows several courts to match."""
+    if not court_filter:
+        return matches
+    cf = court_filter.strip().casefold()
+    return [s for s in matches if s["court"].casefold().startswith(cf)]
 
 
 async def _book(session, slot, date):
@@ -231,33 +314,60 @@ async def run_snipe(job: SnipeJob, notify: NotifyCb) -> None:
             job.attempts += 1
 
             try:
-                matches = await _find(job.session, job.date, job.target_time, job.court)
+                # For multi-court jobs, court is treated as a prefix filter and
+                # applied post-fetch so partial filters like 'PB' still match.
+                court_filter = None if job.count > 1 else job.court
+                matches = await _find(job.session, job.date, job.target_time, court_filter)
+                if job.count > 1:
+                    matches = _filter_by_court_prefix(matches, job.court)
             except requests.RequestException as e:
-                # Network errors are transient — don't notify on every one, just log + continue
                 job.last_message = f"network error: {e}"
                 persist(job)
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
-            if not matches:
+            if job.count > 1:
+                chosen = pick_group(matches, job.count, job.same_number, job.partial)
+            else:
+                chosen = matches[:1] if matches else None
+
+            if not chosen:
                 if job.attempts % REFRESH_LOGIN_EVERY == 0:
                     await _do_login(job.session, job.email, job.password)
                 persist(job)
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
-            # Found something — notify and try to book.
-            slot_summary = ", ".join(f"{s['court']} @ {s['time']}" for s in matches)
-            await notify(job, f"🎾 Found {len(matches)} slot(s): {slot_summary}. Attempting to book...")
+            slot_summary = ", ".join(f"{s['court']} @ {s['time']}" for s in chosen)
+            await notify(job, f"🎾 Found {len(chosen)} slot(s): {slot_summary}. Attempting to book...")
 
-            for s in matches:
+            booked: list[str] = []
+            failures: list[str] = []
+            for s in chosen:
                 ok, msg = await _book(job.session, s, job.date)
                 if ok:
-                    job.status = "booked"
-                    job.last_message = msg
-                    persist(job)
-                    await notify(job, f"✅ {msg}")
-                    return
+                    booked.append(f"{s['court']} @ {s['time']}")
+                else:
+                    failures.append(f"{s['court']} ({msg})")
+                    if job.count == 1:
+                        # Single-court mode: keep trying other matches.
+                        for alt in matches[1:]:
+                            ok2, msg2 = await _book(job.session, alt, job.date)
+                            if ok2:
+                                booked.append(f"{alt['court']} @ {alt['time']}")
+                                break
+                            failures.append(f"{alt['court']} ({msg2})")
+                        break
+
+            if booked:
+                summary = f"Booked {len(booked)} court(s) on {job.date}: " + ", ".join(booked)
+                if failures:
+                    summary += f". Failed: {', '.join(failures)}"
+                job.status = "booked"
+                job.last_message = summary
+                persist(job)
+                await notify(job, f"✅ {summary}")
+                return
 
             job.last_message = "All booking attempts failed; resuming poll"
             persist(job)
