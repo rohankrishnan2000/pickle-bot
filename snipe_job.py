@@ -39,36 +39,66 @@ class SnipeJob:
     chain_time: Optional[str] = None  # after success, auto-snipe this time on the same date
     task: Optional[asyncio.Task] = None
     session: Optional[requests.Session] = None
-    # Runtime-only (not persisted) — intervention state for shorter-duration offers.
-    pending_offer: Optional[dict] = None
-    intervention_event: Optional[asyncio.Event] = None
-    intervention_choice: Optional[str] = None
-    rejected_offers: set = field(default_factory=set)
+    # Runtime-only: per-chat slot index (0..MAX_JOBS_PER_USER-1) used in callback data.
+    slot_index: int = 0
+    # Runtime-only: tracking for the "found an alternative configuration" offers.
+    pending_alt: Optional[dict] = None
+    alt_event: Optional[asyncio.Event] = None
+    alt_choice: Optional[str] = None
+    rejected_alts: set = field(default_factory=set)
+
+
+MAX_JOBS_PER_USER = 3
 
 
 NotifyCb = Callable[..., Awaitable[None]]
 SpawnCb = Callable[["SnipeJob"], Awaitable[None]]
 
 
+_JOBS_DDL = """
+    CREATE TABLE IF NOT EXISTS jobs (
+        chat_id INTEGER NOT NULL,
+        date TEXT NOT NULL,
+        target_time TEXT NOT NULL,
+        court TEXT,
+        email TEXT NOT NULL DEFAULT '',
+        password TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        started_at REAL NOT NULL,
+        last_message TEXT,
+        count INTEGER NOT NULL DEFAULT 1,
+        partial INTEGER NOT NULL DEFAULT 0,
+        same_number INTEGER NOT NULL DEFAULT 0,
+        duration_min INTEGER NOT NULL DEFAULT 30,
+        chain_time TEXT,
+        PRIMARY KEY (chat_id, date, target_time)
+    )
+"""
+
+
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS jobs (
-            chat_id INTEGER PRIMARY KEY,
-            date TEXT NOT NULL,
-            target_time TEXT NOT NULL,
-            court TEXT,
-            email TEXT NOT NULL DEFAULT '',
-            password TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            started_at REAL NOT NULL,
-            last_message TEXT,
-            count INTEGER NOT NULL DEFAULT 1,
-            partial INTEGER NOT NULL DEFAULT 0,
-            same_number INTEGER NOT NULL DEFAULT 0
-        )
-    """)
+    info = conn.execute("PRAGMA table_info(jobs)").fetchall()
+    if info:
+        # Migrate old single-PK schema (chat_id was sole PK) -> composite PK.
+        chat_id_pk_rank = next((c[5] for c in info if c[1] == "chat_id"), 0)
+        target_pk_rank = next((c[5] for c in info if c[1] == "target_time"), 0)
+        if chat_id_pk_rank == 1 and target_pk_rank == 0:
+            conn.execute("ALTER TABLE jobs RENAME TO jobs_legacy")
+            conn.execute(_JOBS_DDL)
+            cols_legacy = [c[1] for c in info]
+            cols_new = [c for c in (
+                "chat_id", "date", "target_time", "court", "email", "password",
+                "status", "attempts", "started_at", "last_message",
+                "count", "partial", "same_number", "duration_min", "chain_time",
+            ) if c in cols_legacy]
+            placeholders = ", ".join(cols_new)
+            conn.execute(f"INSERT INTO jobs ({placeholders}) SELECT {placeholders} FROM jobs_legacy")
+            conn.execute("DROP TABLE jobs_legacy")
+    else:
+        conn.execute(_JOBS_DDL)
+
     for col, ddl in (
         ("count", "ALTER TABLE jobs ADD COLUMN count INTEGER NOT NULL DEFAULT 1"),
         ("partial", "ALTER TABLE jobs ADD COLUMN partial INTEGER NOT NULL DEFAULT 0"),
@@ -157,9 +187,7 @@ def persist(job: SnipeJob) -> None:
         """
         INSERT INTO jobs (chat_id, date, target_time, court, email, password, status, attempts, started_at, last_message, count, partial, same_number, duration_min, chain_time)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(chat_id) DO UPDATE SET
-            date=excluded.date,
-            target_time=excluded.target_time,
+        ON CONFLICT(chat_id, date, target_time) DO UPDATE SET
             court=excluded.court,
             email=excluded.email,
             password=excluded.password,
@@ -182,9 +210,15 @@ def persist(job: SnipeJob) -> None:
     conn.close()
 
 
-def remove(chat_id: int) -> None:
+def remove(chat_id: int, date: str | None = None, target_time: str | None = None) -> None:
     conn = _db()
-    conn.execute("DELETE FROM jobs WHERE chat_id = ?", (chat_id,))
+    if date and target_time:
+        conn.execute(
+            "DELETE FROM jobs WHERE chat_id = ? AND date = ? AND target_time = ?",
+            (chat_id, date, target_time),
+        )
+    else:
+        conn.execute("DELETE FROM jobs WHERE chat_id = ?", (chat_id,))
     conn.commit()
     conn.close()
 
@@ -217,26 +251,47 @@ def mark_all_interrupted() -> list[SnipeJob]:
 
 
 class JobRegistry:
-    """In-memory registry of active jobs. One job per chat_id."""
+    """In-memory registry of active jobs. Up to MAX_JOBS_PER_USER per chat_id."""
 
     def __init__(self) -> None:
-        self._jobs: dict[int, SnipeJob] = {}
+        self._jobs: dict[int, list[SnipeJob]] = {}
 
-    def get(self, chat_id: int) -> Optional[SnipeJob]:
-        return self._jobs.get(chat_id)
+    def jobs_for(self, chat_id: int) -> list[SnipeJob]:
+        return list(self._jobs.get(chat_id, []))
 
-    def has_active(self, chat_id: int) -> bool:
-        job = self._jobs.get(chat_id)
-        return job is not None and job.status == "running"
+    def active_for(self, chat_id: int) -> list[SnipeJob]:
+        return [j for j in self._jobs.get(chat_id, []) if j.status == "running"]
 
-    def add(self, job: SnipeJob) -> None:
-        self._jobs[job.chat_id] = job
+    def active_count(self, chat_id: int) -> int:
+        return len(self.active_for(chat_id))
 
-    def drop(self, chat_id: int) -> None:
-        self._jobs.pop(chat_id, None)
+    def find(self, chat_id: int, slot_index: int) -> Optional[SnipeJob]:
+        for j in self._jobs.get(chat_id, []):
+            if j.slot_index == slot_index and j.status == "running":
+                return j
+        return None
+
+    def add(self, job: SnipeJob) -> bool:
+        """Assign the next free slot 0..MAX_JOBS_PER_USER-1. Returns False if full."""
+        existing = self._jobs.setdefault(job.chat_id, [])
+        taken = {j.slot_index for j in existing if j.status == "running"}
+        for i in range(MAX_JOBS_PER_USER):
+            if i not in taken:
+                job.slot_index = i
+                existing.append(job)
+                return True
+        return False
+
+    def drop(self, job: SnipeJob) -> None:
+        bucket = self._jobs.get(job.chat_id)
+        if not bucket:
+            return
+        self._jobs[job.chat_id] = [j for j in bucket if j is not job]
+        if not self._jobs[job.chat_id]:
+            self._jobs.pop(job.chat_id, None)
 
     def all(self) -> list[SnipeJob]:
-        return list(self._jobs.values())
+        return [j for bucket in self._jobs.values() for j in bucket]
 
 
 _COURT_RE = re.compile(r"^(.*?)\s*(\d+)\s*([A-Za-z]*)\s*$")
@@ -329,19 +384,20 @@ def consecutive_runs(
     return runs
 
 
-def pick_with_duration(
+def find_alternative_offer(
     all_slots: list[dict],
     count: int,
     same_number: bool,
-    partial: bool,
     target_time: str,
     requested_slots: int,
 ) -> Optional[dict]:
-    """Find the best offer: COUNT courts that all share the same duration,
-    preferring the requested duration but falling back to shorter durations.
+    """Search for any book-able offer that doesn't match the user's exact ask.
+    Tries larger configurations first (closer to the original) and returns the
+    first hit. The returned offer is what the user could book if they chose to.
 
-    Returns {"duration_slots": int, "runs": list[list[dict]]} or None.
-    Every booked court is guaranteed to have the same duration_slots.
+    Constraints we relax for alt-search: `partial=True` (fewer courts OK) and
+    we also try `same_number=False` if the user originally required same-number.
+    Returns None if no alternative is available.
     """
     runs = consecutive_runs(all_slots, target_time, requested_slots)
     if not runs:
@@ -352,17 +408,45 @@ def pick_with_duration(
         if not eligible:
             continue
         first_slots = [r[0] for r in eligible.values()]
-        chosen_firsts = pick_group(first_slots, count, same_number, partial)
-        if chosen_firsts:
-            chosen_runs = [eligible[s["court"]] for s in chosen_firsts]
-            return {"duration_slots": d_slots, "runs": chosen_runs}
+        for c_try in range(count, 0, -1):
+            if c_try == count and d_slots == requested_slots:
+                continue  # that's the user's original ask, not an alternative
+            for sn_try in ([True, False] if same_number else [False]):
+                chosen = pick_group(first_slots, c_try, sn_try, partial=True)
+                if chosen and len(chosen) == c_try:
+                    chosen_runs = [eligible[s["court"]] for s in chosen]
+                    return {"duration_slots": d_slots, "runs": chosen_runs}
     return None
 
 
-def _offer_signature(offer: dict) -> tuple:
-    """Stable hashable signature so we don't re-ask the user about the same offer."""
+def alt_signature(offer: dict) -> tuple:
     courts = tuple(sorted(r[0]["court"] for r in offer["runs"]))
     return (offer["duration_slots"], courts)
+
+
+def pick_with_duration(
+    all_slots: list[dict],
+    count: int,
+    same_number: bool,
+    partial: bool,
+    target_time: str,
+    requested_slots: int,
+) -> Optional[dict]:
+    """Find COUNT courts that all have the full requested duration available
+    as consecutive 30-min slots starting at target_time. No partial-duration
+    fallback — if the full window isn't open, returns None and the caller
+    keeps waiting.
+    """
+    runs = consecutive_runs(all_slots, target_time, requested_slots)
+    eligible = {c: r for c, r in runs.items() if len(r) >= requested_slots}
+    if not eligible:
+        return None
+    first_slots = [r[0] for r in eligible.values()]
+    chosen_firsts = pick_group(first_slots, count, same_number, partial)
+    if not chosen_firsts:
+        return None
+    chosen_runs = [eligible[s["court"]] for s in chosen_firsts]
+    return {"duration_slots": requested_slots, "runs": chosen_runs}
 
 
 async def _do_login(session: requests.Session, email: str = "", password: str = "") -> bool:
@@ -384,6 +468,53 @@ def _filter_by_court_prefix(matches: list[dict], court_filter: Optional[str]) ->
 
 async def _book(session, slot, date):
     return await asyncio.to_thread(yourcourts.book_slot, session, slot, date)
+
+
+async def _offer_alt(
+    job: SnipeJob, alt: dict, notify: NotifyCb, spawn: Optional[SpawnCb],
+) -> None:
+    """Notify the user that a different configuration is available and wait for
+    a decision. Accepting books the alt and ends the snipe; skipping resumes
+    polling for the original request."""
+    got_min = alt["duration_slots"] * SLOT_MINUTES
+    got_courts = len(alt["runs"])
+    court_names = ", ".join(r[0]["court"] for r in alt["runs"])
+    delta = []
+    if got_min != job.duration_min:
+        delta.append(f"{got_min} min (asked for {job.duration_min})")
+    if got_courts != job.count:
+        delta.append(f"{got_courts} court(s) (asked for {job.count})")
+    delta_str = "; ".join(delta) or "different configuration"
+
+    job.pending_alt = alt
+    job.alt_event = asyncio.Event()
+    job.alt_choice = None
+    persist(job)
+    await notify(
+        job,
+        f"💡 A different configuration is available for {job.target_time} on {job.date}: "
+        f"{delta_str}. Courts: {court_names}.\n"
+        f"Book it (this will end the snipe) or skip and keep waiting?",
+        markup="alt",
+    )
+    try:
+        await asyncio.wait_for(job.alt_event.wait(), timeout=3600)
+    except asyncio.TimeoutError:
+        job.rejected_alts.add(alt_signature(alt))
+        job.pending_alt = None
+        job.alt_event = None
+        await notify(job, "⌛ No response in 1h — keeping the snipe running.")
+        return
+
+    choice = job.alt_choice
+    job.pending_alt = None
+    job.alt_event = None
+    if choice != "accept":
+        job.rejected_alts.add(alt_signature(alt))
+        return
+
+    await _book_offer(job, alt, notify, spawn)
+    # _book_offer sets status="booked" on success; the snipe ends either way.
 
 
 async def _book_offer(
@@ -475,6 +606,16 @@ async def run_snipe(job: SnipeJob, notify: NotifyCb, spawn: Optional[SpawnCb] = 
                 all_slots = await _find(job.session, job.date, None, None)
                 if job.count > 1 or job.court:
                     all_slots = _filter_by_court_prefix(all_slots, job.court)
+            except yourcourts.SessionExpired:
+                if await _do_login(job.session, job.email, job.password):
+                    job.last_message = "session expired; re-authenticated"
+                    persist(job)
+                    continue  # retry the fetch immediately with a fresh session
+                job.status = "error"
+                job.last_message = "Session expired and re-login failed"
+                persist(job)
+                await notify(job, f"❌ Snipe stopped: session expired and re-login failed ({job.date} {job.target_time}).")
+                return
             except requests.RequestException as e:
                 job.last_message = f"network error: {e}"
                 persist(job)
@@ -486,58 +627,27 @@ async def run_snipe(job: SnipeJob, notify: NotifyCb, spawn: Optional[SpawnCb] = 
                 job.target_time, requested_slots,
             )
 
-            if not offer:
-                if job.attempts % REFRESH_LOGIN_EVERY == 0:
-                    await _do_login(job.session, job.email, job.password)
+            if offer:
+                await _book_offer(job, offer, notify, spawn)
+                if job.status == "booked":
+                    return
                 persist(job)
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
-            if offer["duration_slots"] < requested_slots:
-                sig = _offer_signature(offer)
-                if sig in job.rejected_offers:
-                    persist(job)
-                    await asyncio.sleep(POLL_INTERVAL)
-                    continue
+            # Exact request not available — see if a different configuration is.
+            alt = find_alternative_offer(
+                all_slots, job.count, job.same_number,
+                job.target_time, requested_slots,
+            )
+            if alt and alt_signature(alt) not in job.rejected_alts:
+                await _offer_alt(job, alt, notify, spawn)
+                if job.status in ("booked", "cancelled"):
+                    return
+                # User skipped or timed out; loop continues waiting for exact match.
 
-                got_min = offer["duration_slots"] * SLOT_MINUTES
-                court_names = ", ".join(r[0]["court"] for r in offer["runs"])
-                job.pending_offer = offer
-                job.intervention_event = asyncio.Event()
-                job.intervention_choice = None
-                persist(job)
-                await notify(
-                    job,
-                    f"⏸ *User intervention required.*\n"
-                    f"Requested {job.duration_min} min for {job.target_time} on {job.date}, "
-                    f"but only *{got_min} min* is currently available across "
-                    f"{len(offer['runs'])} court(s): {court_names}.\n\n"
-                    f"Accept the shorter booking, or skip and keep waiting for the full duration?",
-                    markup="intervention",
-                )
-                try:
-                    await asyncio.wait_for(job.intervention_event.wait(), timeout=3600)
-                except asyncio.TimeoutError:
-                    job.rejected_offers.add(sig)
-                    job.pending_offer = None
-                    job.intervention_event = None
-                    await notify(job, "⌛ No response in 1h — skipping that offer and resuming poll.")
-                    await asyncio.sleep(POLL_INTERVAL)
-                    continue
-
-                choice = job.intervention_choice
-                job.pending_offer = None
-                job.intervention_event = None
-                if choice != "accept":
-                    job.rejected_offers.add(sig)
-                    await asyncio.sleep(POLL_INTERVAL)
-                    continue
-                # fall through to book the offer
-
-            await _book_offer(job, offer, notify, spawn)
-            if job.status == "booked":
-                return
-
+            if job.attempts % REFRESH_LOGIN_EVERY == 0:
+                await _do_login(job.session, job.email, job.password)
             persist(job)
             await asyncio.sleep(POLL_INTERVAL)
 

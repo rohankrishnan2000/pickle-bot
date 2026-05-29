@@ -15,6 +15,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 import snipe_job
@@ -42,7 +44,7 @@ LIST_CACHE_TTL = 600  # seconds
 BOOKINGS_CACHE: dict[int, dict] = {}  # chat_id -> {"bookings": list[dict], "ts": float, "session": Session}
 BOOKINGS_CACHE_TTL = 600  # seconds
 
-PENDING_RESUME: dict[int, snipe_job.SnipeJob] = {}  # chat_id -> interrupted job awaiting /resume
+PENDING_RESUME: dict[int, list[snipe_job.SnipeJob]] = {}  # chat_id -> interrupted jobs awaiting /resume
 
 # chat_id -> partially-configured SnipeJob awaiting follow-up answers (count, partial, same_number).
 PENDING_SNIPE: dict[int, snipe_job.SnipeJob] = {}
@@ -84,10 +86,7 @@ async def _request_access(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
     chat_id = update.effective_chat.id
     name = _display_name(update)
-
-    if chat_id in PENDING_APPROVALS:
-        await update.message.reply_text("Your access request is still pending. The admin will let you in soon.")
-        return
+    print(f"[access] request from chat_id={chat_id} name={name!r} pending={chat_id in PENDING_APPROVALS}", flush=True)
 
     if ADMIN_CHAT_ID is None:
         await update.message.reply_text(
@@ -96,23 +95,37 @@ async def _request_access(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    is_retry = chat_id in PENDING_APPROVALS
     PENDING_APPROVALS[chat_id] = {"name": name, "ts": time.time()}
     await update.message.reply_text(
         "Access request sent to the admin. You'll get a message when you're approved."
+        if not is_retry else
+        "Still pending — I pinged the admin again."
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Approve", callback_data=f"approve:{chat_id}"),
          InlineKeyboardButton("❌ Deny", callback_data=f"deny:{chat_id}")],
     ])
+    prefix = "🔁 Repeat access request" if is_retry else "🔑 Access request"
     try:
         await ctx.application.bot.send_message(
             chat_id=ADMIN_CHAT_ID,
-            text=f"🔑 Access request from *{name}*\nchat_id: `{chat_id}`",
-            parse_mode=ParseMode.MARKDOWN,
+            text=f"{prefix} from {name}\nchat_id: {chat_id}",
             reply_markup=kb,
         )
+        print(f"[access] notified admin {ADMIN_CHAT_ID} about {chat_id}", flush=True)
     except Exception as e:
-        print(f"could not notify admin {ADMIN_CHAT_ID}: {e}")
+        print(f"[access] could not notify admin {ADMIN_CHAT_ID}: {e}", flush=True)
+
+
+async def unknown_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch-all for messages from unauthorized users (any type, command or not)."""
+    if not update.effective_chat:
+        return
+    if _allowed(update):
+        return  # allowed users hitting an unknown command — ignore silently
+    if update.message:
+        await _request_access(update, ctx)
 
 
 def _parse_time(raw: str) -> str | None:
@@ -128,16 +141,16 @@ def _parse_date(raw: str) -> str | None:
     return raw if re.fullmatch(r"\d{2}/\d{2}/\d{4}", raw) else None
 
 
-def _intervention_keyboard() -> InlineKeyboardMarkup:
+def _alt_keyboard(slot_index: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Accept shorter", callback_data="iv_accept"),
-         InlineKeyboardButton("⏭ Skip & keep waiting", callback_data="iv_skip")],
+        [InlineKeyboardButton("✅ Book this & end snipe", callback_data=f"alt_accept:{slot_index}"),
+         InlineKeyboardButton("⏭ Skip & keep waiting", callback_data=f"alt_skip:{slot_index}")],
     ])
 
 
 def _make_notifier(app: Application):
     async def notify(job: snipe_job.SnipeJob, text: str, markup: str | None = None) -> None:
-        reply_markup = _intervention_keyboard() if markup == "intervention" else None
+        reply_markup = _alt_keyboard(job.slot_index) if markup == "alt" else None
         try:
             await app.bot.send_message(
                 chat_id=job.chat_id, text=text,
@@ -148,18 +161,17 @@ def _make_notifier(app: Application):
             print(f"notify failed for {job.chat_id}: {e}")
         # Drop the job from the live registry once it terminates.
         if job.status in ("booked", "error", "cancelled"):
-            REGISTRY.drop(job.chat_id)
+            REGISTRY.drop(job)
     return notify
 
 
 def _make_spawner(app: Application):
     """Returns a coroutine that starts a follow-up SnipeJob (used for chain_time)."""
     async def spawn(job: snipe_job.SnipeJob) -> None:
-        if REGISTRY.has_active(job.chat_id):
-            # User started something new in the meantime — don't clobber it.
+        if not REGISTRY.add(job):
+            # User is already at the job cap — skip the chain.
             return
         snipe_job.persist(job)
-        REGISTRY.add(job)
         notify = _make_notifier(app)
         job.task = asyncio.create_task(snipe_job.run_snipe(job, notify, _make_spawner(app)))
     return spawn
@@ -222,13 +234,13 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "`/snipe 05/25/2026 10:00AM 3` — book 3 courts together\n"
         "`/snipe 05/25/2026 10:00AM 3 60 PB` — 3 PB courts, 60 min each\n"
         "`/snipe 05/25/2026 10:00AM 2 90 +11:30AM` — 2 courts 90 min, then chain another snipe at 11:30AM\n"
-        "DURATION must be a multiple of 30 (max 240). If only a shorter time is\n"
-        "available on enough courts, I'll ping you to accept or skip.\n\n"
+        "DURATION must be a multiple of 30 (max 240). I'll only book when the\n"
+        "full duration is available — otherwise I keep waiting.\n\n"
         "*Direct booking* (book from current availability):\n"
         "`/list 05/25/2026`\n\n"
         "*Your reservations:*\n"
         "`/bookings` — list your upcoming reservations; tap to cancel\n\n"
-        "One active snipe per user. Use /cancel to stop it before starting another.",
+        f"Up to {snipe_job.MAX_JOBS_PER_USER} active snipes at a time. /status to list, /cancel N to drop one.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -264,8 +276,8 @@ async def logout_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _deny(update, ctx); return
 
     chat_id = update.effective_chat.id
-    if REGISTRY.has_active(chat_id):
-        await update.message.reply_text("You have an active snipe — /cancel it first.")
+    if REGISTRY.active_count(chat_id) > 0:
+        await update.message.reply_text("You have active snipes — /cancel them first.")
         return
 
     snipe_job.delete_credentials(chat_id)
@@ -280,18 +292,19 @@ async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     chat_id = update.effective_chat.id
 
-    if REGISTRY.has_active(chat_id):
-        existing = REGISTRY.get(chat_id)
+    if REGISTRY.active_count(chat_id) >= snipe_job.MAX_JOBS_PER_USER:
+        running = REGISTRY.active_for(chat_id)
+        lines = ", ".join(f"{j.date} {j.target_time}" for j in running)
         await update.message.reply_text(
-            f"You already have an active snipe: {existing.date} {existing.target_time}. "
-            f"Run /cancel first."
+            f"You're at the {snipe_job.MAX_JOBS_PER_USER}-snipe limit. Active: {lines}.\n"
+            f"Use /cancel N to drop one first (see /status)."
         )
         return
 
     args = ctx.args
     if len(args) < 2:
         await update.message.reply_text(
-            "Usage: /snipe MM/DD/YYYY H:MMam/pm [COUNT] [court name]"
+            "Usage: /snipe MM/DD/YYYY H:MMam/pm [COUNT] [DURATION] [court] [+CHAIN_TIME]"
         )
         return
 
@@ -343,6 +356,12 @@ async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     email, password = creds
 
+    if any(j.date == date and j.target_time == target_time for j in REGISTRY.active_for(chat_id)):
+        await update.message.reply_text(
+            f"You already have an active snipe for {target_time} on {date}."
+        )
+        return
+
     job = snipe_job.SnipeJob(
         chat_id=chat_id, date=date, target_time=target_time, court=court,
         email=email, password=password, count=count,
@@ -370,8 +389,14 @@ async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _start_snipe(job: snipe_job.SnipeJob, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not REGISTRY.add(job):
+        msg = f"You're at the {snipe_job.MAX_JOBS_PER_USER}-snipe limit. /cancel one first."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg)
+        else:
+            await update.message.reply_text(msg)
+        return
     snipe_job.persist(job)
-    REGISTRY.add(job)
     notify = _make_notifier(ctx.application)
     spawn = _make_spawner(ctx.application)
     job.task = asyncio.create_task(snipe_job.run_snipe(job, notify, spawn))
@@ -389,7 +414,7 @@ async def _start_snipe(job: snipe_job.SnipeJob, update: Update, ctx: ContextType
     extras_str = f" ({'; '.join(extras)})" if extras else ""
 
     text = (
-        f"🎯 Sniping started: {job.target_time} on {job.date} ({label}){extras_str}.\n"
+        f"🎯 Snipe [{job.slot_index + 1}] started: {job.target_time} on {job.date} ({label}){extras_str}.\n"
         f"You'll get a ping when something opens up or it's booked."
     )
     if update.callback_query:
@@ -405,32 +430,28 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _deny(update, ctx); return
 
     chat_id = update.effective_chat.id
-    job = REGISTRY.get(chat_id)
-    if not job:
-        await update.message.reply_text("No active snipe.")
+    jobs = sorted(REGISTRY.active_for(chat_id), key=lambda j: j.slot_index)
+    if not jobs:
+        await update.message.reply_text("No active snipes.")
         return
 
-    runtime = int(time.time() - job.started_at)
-    mins, secs = divmod(runtime, 60)
-    label = job.court or "any court"
-    lines = [
-        "Active snipe:",
-        f"  • {job.target_time} on {job.date} ({label})",
-        f"  • status: {job.status}",
-        f"  • attempts: {job.attempts}",
-        f"  • runtime: {mins}m {secs}s",
-    ]
-    if job.count > 1:
-        lines.append(f"  • courts wanted: {job.count}")
-        lines.append(f"  • partial OK: {'yes' if job.partial else 'no'}")
-        lines.append(f"  • same number required: {'yes' if job.same_number else 'no'}")
-    if job.duration_min != 30:
-        lines.append(f"  • duration: {job.duration_min} min")
-    if job.chain_time:
-        lines.append(f"  • chain on success → {job.chain_time}")
-    if job.pending_offer:
-        lines.append("  • ⏸ awaiting your decision on a shorter offer")
-    await update.message.reply_text("\n".join(lines))
+    out = [f"Active snipes ({len(jobs)}/{snipe_job.MAX_JOBS_PER_USER}):"]
+    for j in jobs:
+        runtime = int(time.time() - j.started_at)
+        mins, secs = divmod(runtime, 60)
+        label = j.court or "any court"
+        out.append(f"\n[{j.slot_index + 1}] {j.target_time} on {j.date} ({label})")
+        out.append(f"  • status: {j.status}; attempts: {j.attempts}; runtime: {mins}m {secs}s")
+        if j.count > 1:
+            out.append(f"  • {j.count} courts; partial={'y' if j.partial else 'n'}; "
+                       f"same-num={'y' if j.same_number else 'n'}")
+        if j.duration_min != 30:
+            out.append(f"  • duration: {j.duration_min} min")
+        if j.chain_time:
+            out.append(f"  • chain on success → {j.chain_time}")
+        if j.pending_alt:
+            out.append("  • 💡 awaiting your decision on an alternative offer")
+    await update.message.reply_text("\n".join(out))
 
 
 # ---------- /cancel ----------
@@ -440,14 +461,34 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _deny(update, ctx); return
 
     chat_id = update.effective_chat.id
-    job = REGISTRY.get(chat_id)
-    if not job or not job.task:
-        await update.message.reply_text("No active snipe to cancel.")
+    jobs = sorted(REGISTRY.active_for(chat_id), key=lambda j: j.slot_index)
+    if not jobs:
+        await update.message.reply_text("No active snipes to cancel.")
         return
 
-    job.task.cancel()
-    # The CancelledError path in run_snipe handles notify + persist + drop.
-    await update.message.reply_text("Cancelling...")
+    if ctx.args:
+        try:
+            n = int(ctx.args[0]) - 1
+        except ValueError:
+            await update.message.reply_text("Usage: /cancel [N]  (see /status for N)")
+            return
+        target = REGISTRY.find(chat_id, n)
+        if not target or not target.task:
+            await update.message.reply_text(f"No active snipe at slot {n + 1}.")
+            return
+        target.task.cancel()
+        await update.message.reply_text(f"Cancelling [{n + 1}] {target.date} {target.target_time}...")
+        return
+
+    if len(jobs) == 1:
+        jobs[0].task.cancel()
+        await update.message.reply_text("Cancelling...")
+        return
+
+    listing = "\n".join(f"  [{j.slot_index + 1}] {j.date} {j.target_time}" for j in jobs)
+    await update.message.reply_text(
+        f"You have {len(jobs)} active snipes. Use /cancel N to pick:\n{listing}"
+    )
 
 
 # ---------- /resume ----------
@@ -457,26 +498,55 @@ async def resume_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _deny(update, ctx); return
 
     chat_id = update.effective_chat.id
-    pending = PENDING_RESUME.pop(chat_id, None)
-    if not pending:
+    pending_list = PENDING_RESUME.get(chat_id) or []
+    if not pending_list:
         await update.message.reply_text("Nothing to resume.")
         return
 
-    if REGISTRY.has_active(chat_id):
-        await update.message.reply_text("You already have an active snipe. /cancel it first.")
+    if ctx.args:
+        try:
+            idx = int(ctx.args[0]) - 1
+        except ValueError:
+            await update.message.reply_text("Usage: /resume [N]")
+            return
+    elif len(pending_list) == 1:
+        idx = 0
+    else:
+        listing = "\n".join(
+            f"  [{i + 1}] {p.date} {p.target_time}" for i, p in enumerate(pending_list)
+        )
+        await update.message.reply_text(
+            f"Multiple interrupted snipes — pick one with /resume N:\n{listing}"
+        )
         return
+
+    if idx < 0 or idx >= len(pending_list):
+        await update.message.reply_text(f"No interrupted snipe at slot {idx + 1}.")
+        return
+
+    if REGISTRY.active_count(chat_id) >= snipe_job.MAX_JOBS_PER_USER:
+        await update.message.reply_text(
+            f"You're at the {snipe_job.MAX_JOBS_PER_USER}-snipe limit. /cancel one first."
+        )
+        return
+
+    pending = pending_list.pop(idx)
+    if not pending_list:
+        PENDING_RESUME.pop(chat_id, None)
 
     pending.status = "running"
     pending.attempts = 0
     pending.started_at = time.time()
+    if not REGISTRY.add(pending):
+        await update.message.reply_text("Could not start — registry full.")
+        return
     snipe_job.persist(pending)
-    REGISTRY.add(pending)
 
     notify = _make_notifier(ctx.application)
     spawn = _make_spawner(ctx.application)
     pending.task = asyncio.create_task(snipe_job.run_snipe(pending, notify, spawn))
     await update.message.reply_text(
-        f"Resumed snipe: {pending.target_time} on {pending.date}."
+        f"Resumed snipe [{pending.slot_index + 1}]: {pending.target_time} on {pending.date}."
     )
 
 
@@ -674,15 +744,24 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     elif data == "cxlabort":
         await query.edit_message_text("Kept the reservation.")
 
-    elif data in ("iv_accept", "iv_skip"):
-        job = REGISTRY.get(chat_id)
-        if not job or not job.intervention_event or job.intervention_event.is_set():
-            await query.edit_message_text("That request is no longer active.")
+    elif data.startswith("alt_accept:") or data.startswith("alt_skip:"):
+        action, _, raw = data.partition(":")
+        try:
+            slot = int(raw)
+        except ValueError:
+            await query.edit_message_text("Bad callback.")
             return
-        job.intervention_choice = "accept" if data == "iv_accept" else "skip"
-        job.intervention_event.set()
-        verb = "Accepting the shorter booking..." if data == "iv_accept" else "Skipped. Resuming poll."
-        await query.edit_message_text(verb)
+        job = REGISTRY.find(chat_id, slot)
+        if not job or not job.alt_event or job.alt_event.is_set():
+            await query.edit_message_text("That offer is no longer active.")
+            return
+        job.alt_choice = "accept" if action == "alt_accept" else "skip"
+        job.alt_event.set()
+        await query.edit_message_text(
+            "Booking the alternative — this snipe will end on success."
+            if action == "alt_accept" else
+            "Skipped. Keeping the snipe running."
+        )
 
     elif data.startswith("cfg_partial:"):
         pending = PENDING_SNIPE.get(chat_id)
@@ -708,8 +787,10 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         if not pending or time.time() - pending.started_at > PENDING_SNIPE_TTL:
             await query.edit_message_text("This setup expired. Run /snipe again.")
             return
-        if REGISTRY.has_active(chat_id):
-            await query.edit_message_text("You already have an active snipe. /cancel it first.")
+        if REGISTRY.active_count(chat_id) >= snipe_job.MAX_JOBS_PER_USER:
+            await query.edit_message_text(
+                f"You're at the {snipe_job.MAX_JOBS_PER_USER}-snipe limit. /cancel one first."
+            )
             return
         pending.same_number = data.endswith(":1")
         pending.started_at = time.time()
@@ -759,9 +840,9 @@ async def post_init(app: Application) -> None:
     notify = _make_notifier(app)
     for job in interrupted:
         if job.chat_id not in ALLOWED_CHAT_IDS:
-            snipe_job.remove(job.chat_id)
+            snipe_job.remove(job.chat_id, job.date, job.target_time)
             continue
-        PENDING_RESUME[job.chat_id] = job
+        PENDING_RESUME.setdefault(job.chat_id, []).append(job)
         try:
             await notify(
                 job,
@@ -797,6 +878,13 @@ def main() -> None:
     app.add_handler(CommandHandler("book", list_cmd))
     app.add_handler(CommandHandler("bookings", bookings_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    # Catch-all: any other message (text, sticker, unknown command, etc.) from an
+    # unauthorized user is routed through the access-request flow.
+    app.add_handler(MessageHandler(filters.ALL, unknown_handler))
+
+    async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        print(f"[error] {type(context.error).__name__}: {context.error}", flush=True)
+    app.add_error_handler(_on_error)
 
     print("Bot starting. Allowed chat_ids:", ALLOWED_CHAT_IDS)
     app.run_polling(close_loop=False)

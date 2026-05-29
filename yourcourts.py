@@ -12,6 +12,10 @@ load_dotenv()
 
 BASE_URL = "https://www.yourcourts.com"
 
+
+class SessionExpired(requests.RequestException):
+    """Raised when a request is redirected to the login page (session not authenticated)."""
+
 EMAIL = os.environ.get("YC_EMAIL", "")
 PASSWORD = os.environ.get("YC_PASSWORD", "")
 
@@ -89,6 +93,8 @@ def find_slots(
         params={"reservationDate": date, "facility_id": ""},
     )
     resp.raise_for_status()
+    if "showLogin" in resp.url:
+        raise SessionExpired("Redirected to login while fetching schedule")
 
     raw = re.findall(
         r"href='(/reservation/newreservation/\?[^']*)'\s+title='([^']*)'",
