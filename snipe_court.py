@@ -1,5 +1,8 @@
+import datetime as dt
+import os
 import re
 import time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
@@ -10,13 +13,20 @@ except ModuleNotFoundError:
 
 TARGET_COURT = None      # e.g. "PB 4B" or None for any court at that time
 POLL_INTERVAL = 15       # seconds between checks
+BOOKING_WINDOW_DAYS = 10
+COURT_OPEN_HOUR = 7
+COURT_TIMEZONE = os.environ.get("COURT_TIMEZONE", "America/Los_Angeles").strip()
 
 
 def prompt_date() -> str:
     while True:
         raw = input("Date to snipe (MM/DD/YYYY): ").strip()
         if re.fullmatch(r"\d{2}/\d{2}/\d{4}", raw):
-            return raw
+            try:
+                dt.datetime.strptime(raw, "%m/%d/%Y")
+                return raw
+            except ValueError:
+                pass
         print("  Invalid format. Example: 05/25/2026")
 
 
@@ -30,6 +40,18 @@ def prompt_time() -> str:
         print("  Invalid format. Example: 10:00AM")
 
 
+def activation_time_for(target_date: str) -> dt.datetime:
+    reservation_date = dt.datetime.strptime(target_date, "%m/%d/%Y").date()
+    open_date = reservation_date - dt.timedelta(days=BOOKING_WINDOW_DAYS)
+    tz = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+    if COURT_TIMEZONE:
+        try:
+            tz = ZoneInfo(COURT_TIMEZONE)
+        except ZoneInfoNotFoundError:
+            pass
+    return dt.datetime.combine(open_date, dt.time(hour=COURT_OPEN_HOUR), tzinfo=tz)
+
+
 def main():
     target_date = prompt_date()
     target_time = prompt_time()
@@ -37,6 +59,13 @@ def main():
     court_label = TARGET_COURT or "any court"
     print(f"\nSniping: {target_time} on {target_date} — {court_label}")
     print(f"Polling every {POLL_INTERVAL}s\n")
+
+    activation = activation_time_for(target_date)
+    now = dt.datetime.now(activation.tzinfo)
+    if activation > now:
+        label = activation.strftime("%m/%d/%Y %I:%M%p").replace(" 0", " ")
+        print(f"Court window opens at {label}; waiting to start polling...")
+        time.sleep((activation - now).total_seconds())
 
     session = yourcourts.make_session()
 

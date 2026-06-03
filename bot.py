@@ -235,7 +235,8 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "`/snipe 05/25/2026 10:00AM 3 60 PB` — 3 PB courts, 60 min each\n"
         "`/snipe 05/25/2026 10:00AM 2 90 +11:30AM` — 2 courts 90 min, then chain another snipe at 11:30AM\n"
         "DURATION must be a multiple of 30 (max 240). I'll only book when the\n"
-        "full duration is available — otherwise I keep waiting.\n\n"
+        "full duration is available — otherwise I keep waiting.\n"
+        "Dates more than 10 days out start polling at 7:00AM on the 10-day window date.\n\n"
         "*Direct booking* (book from current availability):\n"
         "`/list 05/25/2026`\n\n"
         "*Your reservations:*\n"
@@ -413,10 +414,17 @@ async def _start_snipe(job: snipe_job.SnipeJob, update: Update, ctx: ContextType
         extras.append(f"chain → {job.chain_time}")
     extras_str = f" ({'; '.join(extras)})" if extras else ""
 
-    text = (
-        f"🎯 Snipe [{job.slot_index + 1}] started: {job.target_time} on {job.date} ({label}){extras_str}.\n"
-        f"You'll get a ping when something opens up or it's booked."
-    )
+    activation = snipe_job.activation_label(job) if snipe_job.seconds_until_activation(job) > 0 else None
+    if activation:
+        text = (
+            f"🎯 Snipe [{job.slot_index + 1}] scheduled: {job.target_time} on {job.date} ({label}){extras_str}.\n"
+            f"It will start polling at {activation}, when the court window opens."
+        )
+    else:
+        text = (
+            f"🎯 Snipe [{job.slot_index + 1}] started: {job.target_time} on {job.date} ({label}){extras_str}.\n"
+            f"You'll get a ping when something opens up or it's booked."
+        )
     if update.callback_query:
         await update.callback_query.edit_message_text(text)
     else:
@@ -442,6 +450,9 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         label = j.court or "any court"
         out.append(f"\n[{j.slot_index + 1}] {j.target_time} on {j.date} ({label})")
         out.append(f"  • status: {j.status}; attempts: {j.attempts}; runtime: {mins}m {secs}s")
+        activation = snipe_job.activation_label(j) if snipe_job.seconds_until_activation(j) > 0 else None
+        if activation:
+            out.append(f"  • starts polling: {activation}")
         if j.count > 1:
             out.append(f"  • {j.count} courts; partial={'y' if j.partial else 'n'}; "
                        f"same-num={'y' if j.same_number else 'n'}")
@@ -545,9 +556,16 @@ async def resume_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     notify = _make_notifier(ctx.application)
     spawn = _make_spawner(ctx.application)
     pending.task = asyncio.create_task(snipe_job.run_snipe(pending, notify, spawn))
-    await update.message.reply_text(
-        f"Resumed snipe [{pending.slot_index + 1}]: {pending.target_time} on {pending.date}."
-    )
+    activation = snipe_job.activation_label(pending) if snipe_job.seconds_until_activation(pending) > 0 else None
+    if activation:
+        await update.message.reply_text(
+            f"Resumed snipe [{pending.slot_index + 1}]: {pending.target_time} on {pending.date}. "
+            f"It will start polling at {activation}."
+        )
+    else:
+        await update.message.reply_text(
+            f"Resumed snipe [{pending.slot_index + 1}]: {pending.target_time} on {pending.date}."
+        )
 
 
 # ---------- /list (direct booking) ----------

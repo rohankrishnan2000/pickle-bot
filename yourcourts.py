@@ -123,7 +123,7 @@ def find_slots(
     return slots
 
 
-def book_slot(session: requests.Session, slot: dict, date: str) -> tuple[bool, str]:
+def book_slot(session: requests.Session, slot: dict, date: str, duration_min: int = 30) -> tuple[bool, str]:
     """Book a slot. Returns (success, message)."""
     form_url = f"{BASE_URL}{slot['href']}"
     form_resp = session.get(form_url)
@@ -153,7 +153,7 @@ def book_slot(session: requests.Session, slot: dict, date: str) -> tuple[bool, s
             "secondaryOwnerId": "",
             "reservableResourceId": slot["resource_id"],
             "reservationTypeId": RESERVATION_TYPE_ID,
-            "duration": DURATION,
+            "duration": str(duration_min),
             "tennisProId": "",
             "additionalPlayersId": "",
             "guests": "",
@@ -166,7 +166,7 @@ def book_slot(session: requests.Session, slot: dict, date: str) -> tuple[bool, s
     )
 
     if resp.status_code == 302:
-        return True, f"Booked {slot['court']} @ {slot['time']} on {date}"
+        return True, f"Booked {slot['court']} @ {slot['time']} for {duration_min}m on {date}"
 
     alerts = re.findall(r'class="alert[^"]*"[^>]*>(.*?)</div>', resp.text, re.DOTALL)
     for a in alerts:

@@ -21,9 +21,12 @@ Two modes:
    ```
    TELEGRAM_BOT_TOKEN=...
    TELEGRAM_ADMIN_CHAT_ID=123456789
+   COURT_TIMEZONE=America/Los_Angeles
    ```
    When a new user messages the bot, you'll get a DM with Approve/Deny buttons.
    Approved chat_ids are persisted in SQLite.
+   `COURT_TIMEZONE` defaults to `America/Los_Angeles`; override it if the court
+   uses a different local timezone.
 
 5. Start the bot:
    ```
@@ -44,7 +47,9 @@ Two modes:
 | `/help` | Command reference. |
 
 Rules:
-- One active snipe per user at a time.
+- Up to three active snipes per user at a time.
+- Snipes for dates more than 10 days out wait until 7:00 AM on the day 10 days
+  before the reservation date, then start polling.
 - On bot restart, interrupted snipes get a DM with `/resume` or `/cancel` to clear them.
 - Direct booking uses a two-step confirm to avoid fat-finger taps on mobile.
 

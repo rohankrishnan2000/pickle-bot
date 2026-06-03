@@ -1,12 +1,15 @@
 """Async snipe job management. One active job per chat_id; SQLite-mirrored state."""
 
 import asyncio
+import datetime as dt
+import os
 import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
 from itertools import groupby
 from typing import Awaitable, Callable, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
@@ -18,6 +21,9 @@ except ModuleNotFoundError:
 DB_PATH = "bot_state.db"
 POLL_INTERVAL = 15
 REFRESH_LOGIN_EVERY = 40  # attempts
+BOOKING_WINDOW_DAYS = 10
+COURT_OPEN_HOUR = 7
+COURT_TIMEZONE = os.environ.get("COURT_TIMEZONE", "America/Los_Angeles").strip()
 
 
 @dataclass
@@ -53,6 +59,51 @@ MAX_JOBS_PER_USER = 3
 
 NotifyCb = Callable[..., Awaitable[None]]
 SpawnCb = Callable[["SnipeJob"], Awaitable[None]]
+
+
+def _parse_job_date(date_str: str) -> Optional[dt.date]:
+    try:
+        return dt.datetime.strptime(date_str, "%m/%d/%Y").date()
+    except ValueError:
+        return None
+
+
+def _court_timezone() -> dt.tzinfo:
+    if COURT_TIMEZONE:
+        try:
+            return ZoneInfo(COURT_TIMEZONE)
+        except ZoneInfoNotFoundError:
+            pass
+    return dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+
+
+def activation_time_for(job: SnipeJob, now: Optional[dt.datetime] = None) -> Optional[dt.datetime]:
+    """Return when polling should begin for a job, or None for bad persisted dates."""
+    target_date = _parse_job_date(job.date)
+    if target_date is None:
+        return None
+    tz = now.tzinfo if now else _court_timezone()
+    open_date = target_date - dt.timedelta(days=BOOKING_WINDOW_DAYS)
+    return dt.datetime.combine(
+        open_date,
+        dt.time(hour=COURT_OPEN_HOUR),
+        tzinfo=tz,
+    )
+
+
+def seconds_until_activation(job: SnipeJob, now: Optional[dt.datetime] = None) -> float:
+    activation = activation_time_for(job, now)
+    if activation is None:
+        return 0
+    now = now or dt.datetime.now(activation.tzinfo)
+    return max(0, (activation - now).total_seconds())
+
+
+def activation_label(job: SnipeJob, now: Optional[dt.datetime] = None) -> Optional[str]:
+    activation = activation_time_for(job, now)
+    if activation is None:
+        return None
+    return activation.strftime("%m/%d/%Y %I:%M%p").replace(" 0", " ")
 
 
 _JOBS_DDL = """
@@ -466,16 +517,18 @@ def _filter_by_court_prefix(matches: list[dict], court_filter: Optional[str]) ->
     return [s for s in matches if s["court"].casefold().startswith(cf)]
 
 
-async def _book(session, slot, date):
-    return await asyncio.to_thread(yourcourts.book_slot, session, slot, date)
+async def _book(session, slot, date, duration_min: int = 30):
+    return await asyncio.to_thread(yourcourts.book_slot, session, slot, date, duration_min)
 
 
 async def _offer_alt(
     job: SnipeJob, alt: dict, notify: NotifyCb, spawn: Optional[SpawnCb],
 ) -> None:
-    """Notify the user that a different configuration is available and wait for
-    a decision. Accepting books the alt and ends the snipe; skipping resumes
-    polling for the original request."""
+    """Auto-book the best available configuration without asking the user.
+
+    `find_alternative_offer` returns the largest available config (most courts
+    and most time, closest to the original ask) first, so the alt passed here is
+    already the best-available grab. We book it immediately and end the snipe."""
     got_min = alt["duration_slots"] * SLOT_MINUTES
     got_courts = len(alt["runs"])
     court_names = ", ".join(r[0]["court"] for r in alt["runs"])
@@ -486,33 +539,11 @@ async def _offer_alt(
         delta.append(f"{got_courts} court(s) (asked for {job.count})")
     delta_str = "; ".join(delta) or "different configuration"
 
-    job.pending_alt = alt
-    job.alt_event = asyncio.Event()
-    job.alt_choice = None
-    persist(job)
     await notify(
         job,
-        f"💡 A different configuration is available for {job.target_time} on {job.date}: "
-        f"{delta_str}. Courts: {court_names}.\n"
-        f"Book it (this will end the snipe) or skip and keep waiting?",
-        markup="alt",
+        f"🤖 Auto-booking best available for {job.target_time} on {job.date}: "
+        f"{delta_str}. Courts: {court_names}.",
     )
-    try:
-        await asyncio.wait_for(job.alt_event.wait(), timeout=3600)
-    except asyncio.TimeoutError:
-        job.rejected_alts.add(alt_signature(alt))
-        job.pending_alt = None
-        job.alt_event = None
-        await notify(job, "⌛ No response in 1h — keeping the snipe running.")
-        return
-
-    choice = job.alt_choice
-    job.pending_alt = None
-    job.alt_event = None
-    if choice != "accept":
-        job.rejected_alts.add(alt_signature(alt))
-        return
-
     await _book_offer(job, alt, notify, spawn)
     # _book_offer sets status="booked" on success; the snipe ends either way.
 
@@ -520,9 +551,10 @@ async def _offer_alt(
 async def _book_offer(
     job: SnipeJob, offer: dict, notify: NotifyCb, spawn: Optional[SpawnCb],
 ) -> None:
-    """Book every slot in the offer. On success, optionally chain a follow-up snipe."""
+    """Book the first slot of each run using the full duration in one request each.
+    On success, optionally chain a follow-up snipe."""
     duration_min = offer["duration_slots"] * SLOT_MINUTES
-    summary_lines = [f"{r[0]['court']} ({len(r)} × {SLOT_MINUTES}m = {duration_min}m starting {r[0]['time']})"
+    summary_lines = [f"{r[0]['court']} ({duration_min}m starting {r[0]['time']})"
                      for r in offer["runs"]]
     await notify(job, f"🎾 Booking {len(offer['runs'])} court(s) for {duration_min} min:\n" +
                  "\n".join(f"  • {s}" for s in summary_lines))
@@ -530,19 +562,13 @@ async def _book_offer(
     booked_courts: list[str] = []
     failures: list[str] = []
     for run in offer["runs"]:
-        court = run[0]["court"]
-        court_ok = True
-        booked_in_run: list[str] = []
-        for slot in run:
-            ok, msg = await _book(job.session, slot, job.date)
-            if ok:
-                booked_in_run.append(slot["time"])
-            else:
-                failures.append(f"{court} @ {slot['time']} ({msg})")
-                court_ok = False
-                break
-        if court_ok:
-            booked_courts.append(f"{court} ({', '.join(booked_in_run)})")
+        first_slot = run[0]
+        court = first_slot["court"]
+        ok, msg = await _book(job.session, first_slot, job.date, duration_min)
+        if ok:
+            booked_courts.append(f"{court} @ {first_slot['time']} ({duration_min}m)")
+        else:
+            failures.append(f"{court} @ {first_slot['time']} ({msg})")
 
     if not booked_courts:
         job.last_message = "All booking attempts failed; resuming poll"
@@ -586,10 +612,17 @@ async def run_snipe(job: SnipeJob, notify: NotifyCb, spawn: Optional[SpawnCb] = 
     - If a shorter duration is the best we can do, ask the user (intervention).
     - If the full booking succeeds and chain_time is set, spawn a follow-up job.
     """
-    job.session = yourcourts.make_session()
     requested_slots = max(1, job.duration_min // SLOT_MINUTES)
 
     try:
+        delay = seconds_until_activation(job)
+        if delay > 0:
+            label = activation_label(job)
+            job.last_message = f"Waiting to start polling until {label}"
+            persist(job)
+            await asyncio.sleep(delay)
+
+        job.session = yourcourts.make_session()
         if not await _do_login(job.session, job.email, job.password):
             job.status = "error"
             job.last_message = "Login to yourcourts.com failed"
