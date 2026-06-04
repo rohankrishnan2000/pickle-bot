@@ -1,3 +1,10 @@
+"""Benchmark the full manual reservation flow against the live site.
+
+This is a measurement helper rather than an app entrypoint: it times the same
+HTTP sequence the real client uses so you can see where latency is being spent
+during login, schedule fetch, form load, and booking POST.
+"""
+
 import os
 import re
 import time
@@ -20,6 +27,7 @@ RESERVATION_TYPE_ID = "1200"
 
 
 def extract_csrf(html: str) -> str | None:
+    """Extract the CSRF token required by the final booking POST."""
     m = re.search(r'name="SYNCHRONIZER_TOKEN"[^>]*value="([^"]+)"', html)
     if not m:
         m = re.search(r'value="([^"]+)"[^>]*name="SYNCHRONIZER_TOKEN"', html)
@@ -27,6 +35,7 @@ def extract_csrf(html: str) -> str | None:
 
 
 def extract_field(html: str, name: str) -> str | None:
+    """Extract a hidden input value from the reservation form HTML."""
     m = re.search(rf'name="{name}"[^>]*value="([^"]*)"', html)
     if not m:
         m = re.search(rf'value="([^"]*)"[^>]*name="{name}"', html)
@@ -34,6 +43,7 @@ def extract_field(html: str, name: str) -> str | None:
 
 
 def bench():
+    """Replay the live booking sequence and print step-level timings."""
     session = requests.Session()
     session.headers.update({
         "User-Agent": (
@@ -46,6 +56,8 @@ def bench():
     timings = {}
     total_start = time.perf_counter()
 
+    # The numbered phases line up with the same browser-ish flow used in
+    # yourcourts.login(), find_slots(), and book_slot().
     # 1. GET login page
     t = time.perf_counter()
     session.get(f"{BASE_URL}/login")

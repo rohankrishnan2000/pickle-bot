@@ -1,4 +1,12 @@
-"""Telegram bot for managing court snipes and direct bookings."""
+"""Telegram interface for court sniping, direct booking, and reservation cleanup.
+
+At a high level this file is the conversation layer of the app:
+
+1. validate that a Telegram user is approved
+2. collect command arguments and any follow-up choices
+3. translate those inputs into ``yourcourts`` calls or ``snipe_job`` tasks
+4. send the resulting status, confirmation, and recovery messages back to chat
+"""
 
 import asyncio
 import os
@@ -19,10 +27,10 @@ from telegram.ext import (
     filters,
 )
 
+load_dotenv()
+
 import snipe_job
 import yourcourts
-
-load_dotenv()
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 _raw_ids = os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").strip()
@@ -52,6 +60,7 @@ PENDING_SNIPE_TTL = 300
 
 
 def _allowed(update: Update) -> bool:
+    """Check whether the current Telegram chat is allowed to use the bot."""
     chat = update.effective_chat
     if chat is None:
         return False
@@ -59,7 +68,11 @@ def _allowed(update: Update) -> bool:
 
 
 async def _deny(update: Update, ctx: ContextTypes.DEFAULT_TYPE | None = None) -> None:
-    """For messages: forward to admin as access request. For callbacks: silent reject."""
+    """Route unauthorized activity into the approval flow.
+
+    Regular chat messages can trigger an admin approval request. Callback taps
+    only get a rejection because there is no useful context to forward.
+    """
     if update.message and ctx is not None:
         await _request_access(update, ctx)
     elif update.message:
@@ -69,6 +82,7 @@ async def _deny(update: Update, ctx: ContextTypes.DEFAULT_TYPE | None = None) ->
 
 
 def _display_name(update: Update) -> str:
+    """Build a friendly label for approval notifications and audit storage."""
     user = update.effective_user
     if not user:
         return "?"
@@ -80,7 +94,7 @@ def _display_name(update: Update) -> str:
 
 
 async def _request_access(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Called when an unauthorized user messages the bot. Forwards request to admin."""
+    """Forward an access request to the admin and remember it in memory."""
     if not update.message or not update.effective_chat:
         return
 
@@ -119,7 +133,7 @@ async def _request_access(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def unknown_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Catch-all for messages from unauthorized users (any type, command or not)."""
+    """Use unknown inbound messages as another entry into the approval flow."""
     if not update.effective_chat:
         return
     if _allowed(update):
@@ -129,6 +143,7 @@ async def unknown_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 def _parse_time(raw: str) -> str | None:
+    """Normalize Telegram command time tokens into the format used everywhere else."""
     raw = raw.strip().upper().replace(" ", "")
     m = re.fullmatch(r"(\d{1,2}):(\d{2})(AM|PM)", raw)
     if not m:
@@ -138,10 +153,12 @@ def _parse_time(raw: str) -> str | None:
 
 
 def _parse_date(raw: str) -> str | None:
+    """Validate date strings without converting them away from user-facing format."""
     return raw if re.fullmatch(r"\d{2}/\d{2}/\d{4}", raw) else None
 
 
 def _alt_keyboard(slot_index: int) -> InlineKeyboardMarkup:
+    """Buttons shown when a running snipe can take an alternative offer."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Book this & end snipe", callback_data=f"alt_accept:{slot_index}"),
          InlineKeyboardButton("⏭ Skip & keep waiting", callback_data=f"alt_skip:{slot_index}")],
@@ -149,6 +166,12 @@ def _alt_keyboard(slot_index: int) -> InlineKeyboardMarkup:
 
 
 def _make_notifier(app: Application):
+    """Build the callback that ``snipe_job.run_snipe`` uses for user-facing updates.
+
+    This keeps the polling engine decoupled from Telegram specifics: the job
+    layer only knows it can emit messages, while this closure handles the actual
+    bot send and registry cleanup.
+    """
     async def notify(job: snipe_job.SnipeJob, text: str, markup: str | None = None) -> None:
         reply_markup = _alt_keyboard(job.slot_index) if markup == "alt" else None
         try:
@@ -166,7 +189,7 @@ def _make_notifier(app: Application):
 
 
 def _make_spawner(app: Application):
-    """Returns a coroutine that starts a follow-up SnipeJob (used for chain_time)."""
+    """Return a callback that can start chained follow-up jobs after a booking."""
     async def spawn(job: snipe_job.SnipeJob) -> None:
         if not REGISTRY.add(job):
             # User is already at the job cap — skip the chain.
@@ -180,6 +203,7 @@ def _make_spawner(app: Application):
 # ---------- /start, /help ----------
 
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Entry point for new users: either request approval or explain the bot flow."""
     if not _allowed(update):
         await _request_access(update, ctx)
         return
@@ -222,6 +246,7 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the condensed command reference once a user is authorized."""
     if not _allowed(update):
         await _deny(update, ctx); return
     await update.message.reply_text(
@@ -249,6 +274,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------- /login, /logout ----------
 
 async def login_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Verify YourCourts credentials now so later snipes can run unattended."""
     if not _allowed(update):
         await _deny(update, ctx); return
 
@@ -273,6 +299,7 @@ async def login_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def logout_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove stored credentials after ensuring no active jobs still depend on them."""
     if not _allowed(update):
         await _deny(update, ctx); return
 
@@ -288,6 +315,13 @@ async def logout_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------- /snipe ----------
 
 async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Parse ``/snipe`` arguments and either start a job or ask follow-up questions.
+
+    This is the bridge from chat commands into :mod:`snipe_job`: it validates
+    the request, loads credentials, builds a :class:`snipe_job.SnipeJob`, and
+    then either launches it immediately or gathers the extra policy choices that
+    multi-court bookings need.
+    """
     if not _allowed(update):
         await _deny(update, ctx); return
 
@@ -321,7 +355,7 @@ async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     rest = list(args[2:])
 
-    # Pull off any +HH:MMam/pm chain-time tokens anywhere in the args.
+    # Chain time is optional and can appear anywhere after the main date/time.
     chain_time: str | None = None
     chain_tokens = [t for t in rest if t.startswith("+")]
     rest = [t for t in rest if not t.startswith("+")]
@@ -335,7 +369,7 @@ async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
         chain_time = ct
 
-    # Up to two leading numerics: COUNT then DURATION (minutes, multiple of 30).
+    # Numeric suffixes are positional: first court count, then requested duration.
     count = 1
     duration_min = 30
     if rest and rest[0].isdigit():
@@ -373,7 +407,8 @@ async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _start_snipe(job, update, ctx)
         return
 
-    # Multi-court: ask follow-up questions before starting.
+    # Multi-court jobs need one more round-trip so the user can define how
+    # aggressive the fallback behavior should be.
     PENDING_SNIPE[chat_id] = job
     job.started_at = time.time()  # used to expire the pending config
     label = court or "any court"
@@ -390,6 +425,7 @@ async def snipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _start_snipe(job: snipe_job.SnipeJob, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Register, persist, and launch a configured snipe job."""
     if not REGISTRY.add(job):
         msg = f"You're at the {snipe_job.MAX_JOBS_PER_USER}-snipe limit. /cancel one first."
         if update.callback_query:
@@ -434,6 +470,7 @@ async def _start_snipe(job: snipe_job.SnipeJob, update: Update, ctx: ContextType
 # ---------- /status ----------
 
 async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Summarize the currently active in-memory jobs for this chat."""
     if not _allowed(update):
         await _deny(update, ctx); return
 
@@ -468,6 +505,7 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------- /cancel ----------
 
 async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel one running snipe, or prompt the user to choose when several exist."""
     if not _allowed(update):
         await _deny(update, ctx); return
 
@@ -505,6 +543,7 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------- /resume ----------
 
 async def resume_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Restart a job that was marked interrupted during startup recovery."""
     if not _allowed(update):
         await _deny(update, ctx); return
 
@@ -571,6 +610,7 @@ async def resume_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------- /list (direct booking) ----------
 
 async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run the direct-booking flow: fetch openings and present them as buttons."""
     if not _allowed(update):
         await _deny(update, ctx); return
 
@@ -602,7 +642,7 @@ async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("No openings.")
         return
 
-    # Cache slots by short index so callback_data stays small.
+    # Cache slots by short index so callback_data stays within Telegram's size limit.
     chat_id = update.effective_chat.id
     LIST_CACHE[chat_id] = {"date": date, "slots": slots, "ts": time.time(), "session": session}
 
@@ -632,6 +672,7 @@ async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------- /bookings (list + cancel my reservations) ----------
 
 async def bookings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """List the user's upcoming reservations and prepare inline cancel actions."""
     if not _allowed(update):
         await _deny(update, ctx); return
 
@@ -682,6 +723,16 @@ async def bookings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------- Callback queries (book confirmation flow) ----------
 
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle every inline-button flow in one place.
+
+    The callbacks are grouped by prefix:
+
+    - ``pick`` / ``confirm`` for direct booking
+    - ``cxl*`` for reservation cancellation
+    - ``alt_*`` for alternative snipe offers
+    - ``cfg_*`` for finishing multi-court snipe setup
+    - ``approve`` / ``deny`` for admin access control
+    """
     if not _allowed(update):
         await _deny(update, ctx); return
 
@@ -847,7 +898,12 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 # ---------- Startup ----------
 
 async def post_init(app: Application) -> None:
-    """Called once the application is set up. Load allowlist + surface interrupted snipes."""
+    """Load durable state once Telegram has initialized the app object.
+
+    This is where the process-level bot reconnects to the persistent world:
+    approved users are reloaded, and interrupted snipes are surfaced so people
+    can consciously resume or cancel them after a restart.
+    """
     for cid in snipe_job.load_allowed_users():
         ALLOWED_CHAT_IDS.add(cid)
     if ADMIN_CHAT_ID is not None:
@@ -872,6 +928,7 @@ async def post_init(app: Application) -> None:
 
 
 def main() -> None:
+    """Wire up handlers and start Telegram long-polling."""
     if not TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN not set in .env")
     if not ALLOWED_CHAT_IDS and ADMIN_CHAT_ID is None:

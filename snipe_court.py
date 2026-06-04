@@ -5,6 +5,9 @@ import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 try:
     import pickle_bot.yourcourts as yourcourts
@@ -19,6 +22,7 @@ COURT_TIMEZONE = os.environ.get("COURT_TIMEZONE", "America/Los_Angeles").strip()
 
 
 def prompt_date() -> str:
+    """Collect a valid reservation date from the terminal user."""
     while True:
         raw = input("Date to snipe (MM/DD/YYYY): ").strip()
         if re.fullmatch(r"\d{2}/\d{2}/\d{4}", raw):
@@ -31,6 +35,7 @@ def prompt_date() -> str:
 
 
 def prompt_time() -> str:
+    """Collect a valid target time in the same format the web client uses."""
     while True:
         raw = input("Time to snipe (e.g. 7:00AM, 10:30AM, 2:00PM): ").strip().upper().replace(" ", "")
         m = re.fullmatch(r"(\d{1,2}):(\d{2})(AM|PM)", raw)
@@ -41,6 +46,7 @@ def prompt_time() -> str:
 
 
 def activation_time_for(target_date: str) -> dt.datetime:
+    """Return when the site's booking window opens for a reservation date."""
     reservation_date = dt.datetime.strptime(target_date, "%m/%d/%Y").date()
     open_date = reservation_date - dt.timedelta(days=BOOKING_WINDOW_DAYS)
     tz = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
@@ -53,6 +59,7 @@ def activation_time_for(target_date: str) -> dt.datetime:
 
 
 def main():
+    """Run the standalone polling loop without Telegram or SQLite state."""
     target_date = prompt_date()
     target_time = prompt_time()
 
@@ -60,6 +67,7 @@ def main():
     print(f"\nSniping: {target_time} on {target_date} — {court_label}")
     print(f"Polling every {POLL_INTERVAL}s\n")
 
+    # Mirror the same delayed-start behavior used by the Telegram snipe jobs.
     activation = activation_time_for(target_date)
     now = dt.datetime.now(activation.tzinfo)
     if activation > now:

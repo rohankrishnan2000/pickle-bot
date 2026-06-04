@@ -1,4 +1,15 @@
+"""Small CLI for the direct-booking path.
+
+Unlike the Telegram bot, this script is synchronous and interactive: it logs in,
+lists what is currently open for a date, and lets a human choose one slot to
+book immediately.
+"""
+
 from collections import defaultdict
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 try:
     import pickle_bot.yourcourts as yourcourts
@@ -9,6 +20,7 @@ DEFAULT_DATE = "05/24/2026"
 
 
 def display_slots(slots: list[dict]) -> list[dict]:
+    """Print slots in a stable time/court order and return that numbered sequence."""
     by_time = defaultdict(list)
     for s in slots:
         by_time[s["time"]].append(s)
@@ -28,6 +40,7 @@ def display_slots(slots: list[dict]) -> list[dict]:
 
 
 def main():
+    """Run the login -> list openings -> confirm -> book CLI flow."""
     session = yourcourts.make_session()
 
     print("Logging in...")

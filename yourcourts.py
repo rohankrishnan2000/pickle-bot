@@ -1,4 +1,17 @@
-"""Shared yourcourts.com client used by snipe_court.py, book_court.py, and the Telegram bot."""
+"""HTTP client for the yourcourts.com reservation flow.
+
+This module is the lowest layer in the project. Every higher-level workflow
+eventually comes through here:
+
+1. create a browser-like :class:`requests.Session`
+2. log in with account credentials
+3. fetch schedule pages and parse open slots
+4. load the reservation form for a chosen slot
+5. submit the booking or cancellation request
+
+The CLI scripts call these helpers directly, and the Telegram bot wraps them in
+async jobs via :mod:`snipe_job`.
+"""
 
 import os
 import re
@@ -6,9 +19,6 @@ from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 import requests
-from dotenv import load_dotenv
-
-load_dotenv()
 
 BASE_URL = "https://www.yourcourts.com"
 
@@ -16,32 +26,43 @@ BASE_URL = "https://www.yourcourts.com"
 class SessionExpired(requests.RequestException):
     """Raised when a request is redirected to the login page (session not authenticated)."""
 
-EMAIL = os.environ.get("YC_EMAIL", "")
-PASSWORD = os.environ.get("YC_PASSWORD", "")
-
 FACILITY_ID = "1535"
-DURATION = "30"
 RESERVATION_TYPE_ID = "1200"
 
 TIME_ID_BASE = 13
-TIME_LABELS: list[str] = []
-for _h in range(7, 22):
-    for _m in (0, 30):
-        _suffix = "AM" if _h < 12 else "PM"
-        _display_h = _h if _h <= 12 else _h - 12
-        if _display_h == 0:
-            _display_h = 12
-        TIME_LABELS.append(f"{_display_h}:{_m:02d}{_suffix}")
 
 
 def time_to_id(time_str: str) -> int:
-    try:
-        return TIME_LABELS.index(time_str) + TIME_ID_BASE
-    except ValueError:
+    """Convert a human time like ``"7:30AM"`` into YourCourts' slot id.
+
+    The rest of the codebase uses this to sort slots chronologically and to
+    reconstruct a ``startTimeId`` when the reservation form omits it.
+    """
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})(AM|PM)", time_str.strip().upper())
+    if not m:
         return -1
+
+    hour = int(m.group(1))
+    minute = int(m.group(2))
+    meridiem = m.group(3)
+    if hour < 1 or hour > 12 or minute not in (0, 30):
+        return -1
+
+    hour_24 = hour % 12
+    if meridiem == "PM":
+        hour_24 += 12
+
+    minutes = hour_24 * 60 + minute
+    first_slot = 7 * 60
+    last_slot = 21 * 60 + 30
+    if minutes < first_slot or minutes > last_slot:
+        return -1
+
+    return TIME_ID_BASE + (minutes - first_slot) // 30
 
 
 def extract_csrf(html: str) -> str | None:
+    """Pull the reservation form CSRF token out of raw HTML."""
     m = re.search(r'name="SYNCHRONIZER_TOKEN"[^>]*value="([^"]+)"', html)
     if not m:
         m = re.search(r'value="([^"]+)"[^>]*name="SYNCHRONIZER_TOKEN"', html)
@@ -49,6 +70,7 @@ def extract_csrf(html: str) -> str | None:
 
 
 def extract_field(html: str, name: str) -> str | None:
+    """Extract a hidden input value by field name from a reservation form."""
     m = re.search(rf'name="{name}"[^>]*value="([^"]*)"', html)
     if not m:
         m = re.search(rf'value="([^"]*)"[^>]*name="{name}"', html)
@@ -56,6 +78,7 @@ def extract_field(html: str, name: str) -> str | None:
 
 
 def make_session() -> requests.Session:
+    """Create a session that looks enough like a normal browser to avoid friction."""
     session = requests.Session()
     session.headers.update({
         "User-Agent": (
@@ -68,8 +91,9 @@ def make_session() -> requests.Session:
 
 
 def login(session: requests.Session, email: str | None = None, password: str | None = None) -> bool:
-    email = email or EMAIL
-    password = password or PASSWORD
+    """Authenticate a session for all later schedule, booking, and cancel calls."""
+    email = email or os.environ.get("YC_EMAIL", "")
+    password = password or os.environ.get("YC_PASSWORD", "")
     if not email or not password:
         raise RuntimeError("No credentials provided and YC_EMAIL/YC_PASSWORD not set in environment")
     session.get(f"{BASE_URL}/login")
@@ -87,7 +111,14 @@ def find_slots(
     target_time: str | None = None,
     target_court: str | None = None,
 ) -> list[dict]:
-    """Fetch slots for `date`. If target_time/target_court are given, filter to matches."""
+    """Fetch and parse currently open reservation slots for a date.
+
+    This is the discovery step for both main workflows:
+
+    - direct booking: the bot or CLI lists whatever is open right now
+    - sniping: the polling loop repeatedly calls this until the desired
+      configuration appears
+    """
     resp = session.get(
         f"{BASE_URL}/facility/viewschedule",
         params={"reservationDate": date, "facility_id": ""},
@@ -124,7 +155,13 @@ def find_slots(
 
 
 def book_slot(session: requests.Session, slot: dict, date: str, duration_min: int = 30) -> tuple[bool, str]:
-    """Book a slot. Returns (success, message)."""
+    """Submit the full reservation form for an open slot.
+
+    This function is the final step in every successful path. Higher-level code
+    decides *which* slot or slot-group to take; this helper performs the actual
+    POST and translates the response into a ``(success, message)`` tuple that
+    callers can surface to the user.
+    """
     form_url = f"{BASE_URL}{slot['href']}"
     form_resp = session.get(form_url)
     form_resp.raise_for_status()
@@ -177,7 +214,7 @@ def book_slot(session: requests.Session, slot: dict, date: str, duration_min: in
 
 
 def list_my_bookings(session: requests.Session, days_ahead: int = 30) -> list[dict]:
-    """Fetch the current user's upcoming reservations via the calendar JSON endpoint."""
+    """Fetch the current user's reservations for the Telegram ``/bookings`` flow."""
     now = datetime.now().astimezone()
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=days_ahead)
@@ -206,7 +243,11 @@ def list_my_bookings(session: requests.Session, days_ahead: int = 30) -> list[di
 
 
 def cancel_reservation(session: requests.Session, reservation_id: str) -> tuple[bool, str]:
-    """Cancel a reservation. Returns (success, message)."""
+    """Cancel a reservation chosen from ``list_my_bookings``.
+
+    The bot uses this after the user confirms a cancellation button in the
+    ``/bookings`` callback flow.
+    """
     preview = session.get(f"{BASE_URL}/reservation/previewCancelReservation/{reservation_id}",
                           params={"facility_id": ""})
     if preview.status_code != 200:

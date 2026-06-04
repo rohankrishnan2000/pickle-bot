@@ -1,4 +1,14 @@
-"""Async snipe job management. One active job per chat_id; SQLite-mirrored state."""
+"""Async snipe orchestration plus lightweight persistence.
+
+This module is the project's scheduling engine. ``bot.py`` translates Telegram
+commands into :class:`SnipeJob` objects, and this module takes over from there:
+
+1. persist job state in SQLite so restarts can recover cleanly
+2. wait until the reservation window opens
+3. poll YourCourts for matching availability
+4. choose the best set of courts that satisfies the request
+5. attempt the booking and report the outcome back through a notifier callback
+"""
 
 import asyncio
 import datetime as dt
@@ -62,6 +72,7 @@ SpawnCb = Callable[["SnipeJob"], Awaitable[None]]
 
 
 def _parse_job_date(date_str: str) -> Optional[dt.date]:
+    """Parse persisted ``MM/DD/YYYY`` strings back into dates."""
     try:
         return dt.datetime.strptime(date_str, "%m/%d/%Y").date()
     except ValueError:
@@ -69,6 +80,7 @@ def _parse_job_date(date_str: str) -> Optional[dt.date]:
 
 
 def _court_timezone() -> dt.tzinfo:
+    """Resolve the timezone used for booking-window calculations."""
     if COURT_TIMEZONE:
         try:
             return ZoneInfo(COURT_TIMEZONE)
@@ -78,7 +90,11 @@ def _court_timezone() -> dt.tzinfo:
 
 
 def activation_time_for(job: SnipeJob, now: Optional[dt.datetime] = None) -> Optional[dt.datetime]:
-    """Return when polling should begin for a job, or None for bad persisted dates."""
+    """Return when polling should begin for a job.
+
+    Snipes more than ``BOOKING_WINDOW_DAYS`` out do not poll immediately. The
+    bot and the CLI both use this to explain when a future snipe will wake up.
+    """
     target_date = _parse_job_date(job.date)
     if target_date is None:
         return None
@@ -92,6 +108,7 @@ def activation_time_for(job: SnipeJob, now: Optional[dt.datetime] = None) -> Opt
 
 
 def seconds_until_activation(job: SnipeJob, now: Optional[dt.datetime] = None) -> float:
+    """Return the remaining delay before a job is allowed to start polling."""
     activation = activation_time_for(job, now)
     if activation is None:
         return 0
@@ -100,6 +117,7 @@ def seconds_until_activation(job: SnipeJob, now: Optional[dt.datetime] = None) -
 
 
 def activation_label(job: SnipeJob, now: Optional[dt.datetime] = None) -> Optional[str]:
+    """Format the activation time for user-facing status messages."""
     activation = activation_time_for(job, now)
     if activation is None:
         return None
@@ -129,10 +147,17 @@ _JOBS_DDL = """
 
 
 def _db() -> sqlite3.Connection:
+    """Open the SQLite state DB and ensure the schema is current.
+
+    ``bot.py`` relies on this storage for three pieces of long-lived state:
+    saved credentials, the allowlist, and persisted snipe jobs that can be
+    resumed after a restart.
+    """
     conn = sqlite3.connect(DB_PATH)
     info = conn.execute("PRAGMA table_info(jobs)").fetchall()
     if info:
-        # Migrate old single-PK schema (chat_id was sole PK) -> composite PK.
+        # Old versions only allowed one job per chat_id. The composite key lets
+        # us persist multiple concurrent snipes for different date/time pairs.
         chat_id_pk_rank = next((c[5] for c in info if c[1] == "chat_id"), 0)
         target_pk_rank = next((c[5] for c in info if c[1] == "target_time"), 0)
         if chat_id_pk_rank == 1 and target_pk_rank == 0:
@@ -180,6 +205,7 @@ def _db() -> sqlite3.Connection:
 
 
 def add_allowed_user(chat_id: int, display_name: str | None) -> None:
+    """Persist a newly approved Telegram user."""
     conn = _db()
     conn.execute(
         "INSERT OR IGNORE INTO allowed_users (chat_id, display_name, approved_at) VALUES (?, ?, ?)",
@@ -190,6 +216,7 @@ def add_allowed_user(chat_id: int, display_name: str | None) -> None:
 
 
 def remove_allowed_user(chat_id: int) -> None:
+    """Remove a user from the persisted allowlist."""
     conn = _db()
     conn.execute("DELETE FROM allowed_users WHERE chat_id = ?", (chat_id,))
     conn.commit()
@@ -197,6 +224,7 @@ def remove_allowed_user(chat_id: int) -> None:
 
 
 def load_allowed_users() -> list[int]:
+    """Load the allowlist during bot startup."""
     conn = _db()
     rows = conn.execute("SELECT chat_id FROM allowed_users").fetchall()
     conn.close()
@@ -204,6 +232,7 @@ def load_allowed_users() -> list[int]:
 
 
 def save_credentials(chat_id: int, email: str, password: str) -> None:
+    """Store the YourCourts credentials that later snipes will use."""
     conn = _db()
     conn.execute(
         """
@@ -217,6 +246,7 @@ def save_credentials(chat_id: int, email: str, password: str) -> None:
 
 
 def get_credentials(chat_id: int) -> tuple[str, str] | None:
+    """Fetch saved credentials for login and direct-booking flows."""
     conn = _db()
     row = conn.execute(
         "SELECT email, password FROM users WHERE chat_id = ?", (chat_id,)
@@ -226,6 +256,7 @@ def get_credentials(chat_id: int) -> tuple[str, str] | None:
 
 
 def delete_credentials(chat_id: int) -> None:
+    """Forget saved credentials after logout."""
     conn = _db()
     conn.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
     conn.commit()
@@ -233,6 +264,7 @@ def delete_credentials(chat_id: int) -> None:
 
 
 def persist(job: SnipeJob) -> None:
+    """Mirror the current in-memory job state into SQLite."""
     conn = _db()
     conn.execute(
         """
@@ -262,6 +294,7 @@ def persist(job: SnipeJob) -> None:
 
 
 def remove(chat_id: int, date: str | None = None, target_time: str | None = None) -> None:
+    """Delete one persisted job or every job owned by a chat id."""
     conn = _db()
     if date and target_time:
         conn.execute(
@@ -275,6 +308,7 @@ def remove(chat_id: int, date: str | None = None, target_time: str | None = None
 
 
 def load_persisted() -> list[SnipeJob]:
+    """Reconstruct saved jobs from SQLite into runtime ``SnipeJob`` objects."""
     conn = _db()
     rows = conn.execute(
         "SELECT chat_id, date, target_time, court, email, password, status, attempts, started_at, last_message, count, partial, same_number, duration_min, chain_time FROM jobs"
@@ -293,7 +327,11 @@ def load_persisted() -> list[SnipeJob]:
 
 
 def mark_all_interrupted() -> list[SnipeJob]:
-    """Called on startup. Any job that was 'running' didn't shut down cleanly."""
+    """Mark in-flight jobs as interrupted during bot startup recovery.
+
+    ``bot.post_init`` uses this so users can explicitly choose whether to
+    resume or discard work that was alive before the process exited.
+    """
     conn = _db()
     conn.execute("UPDATE jobs SET status='interrupted' WHERE status='running'")
     conn.commit()
@@ -302,7 +340,12 @@ def mark_all_interrupted() -> list[SnipeJob]:
 
 
 class JobRegistry:
-    """In-memory registry of active jobs. Up to MAX_JOBS_PER_USER per chat_id."""
+    """Track the currently running jobs inside this Python process.
+
+    SQLite keeps the durable copy, but the bot needs fast lookup by chat id and
+    callback slot number while commands are being handled. This registry fills
+    that runtime-only role.
+    """
 
     def __init__(self) -> None:
         self._jobs: dict[int, list[SnipeJob]] = {}
@@ -349,7 +392,7 @@ _COURT_RE = re.compile(r"^(.*?)\s*(\d+)\s*([A-Za-z]*)\s*$")
 
 
 def _court_key(name: str) -> tuple[str, int, str]:
-    """Parse 'PB 4B' -> ('PB', 4, 'B'). Falls back gracefully for odd names."""
+    """Normalize court names so multi-court selection can group nearby courts."""
     m = _COURT_RE.match(name.strip())
     if not m:
         return (name.strip(), 0, "")
@@ -471,6 +514,7 @@ def find_alternative_offer(
 
 
 def alt_signature(offer: dict) -> tuple:
+    """Create a stable identifier so skipped alternatives are not re-offered."""
     courts = tuple(sorted(r[0]["court"] for r in offer["runs"]))
     return (offer["duration_slots"], courts)
 
@@ -501,10 +545,12 @@ def pick_with_duration(
 
 
 async def _do_login(session: requests.Session, email: str = "", password: str = "") -> bool:
+    """Run the blocking login call in a worker thread for the async loop."""
     return await asyncio.to_thread(yourcourts.login, session, email or None, password or None)
 
 
 async def _find(session, date, target_time, court):
+    """Async wrapper around ``yourcourts.find_slots``."""
     return await asyncio.to_thread(yourcourts.find_slots, session, date, target_time, court)
 
 
@@ -518,6 +564,7 @@ def _filter_by_court_prefix(matches: list[dict], court_filter: Optional[str]) ->
 
 
 async def _book(session, slot, date, duration_min: int = 30):
+    """Async wrapper around ``yourcourts.book_slot``."""
     return await asyncio.to_thread(yourcourts.book_slot, session, slot, date, duration_min)
 
 
@@ -615,6 +662,8 @@ async def run_snipe(job: SnipeJob, notify: NotifyCb, spawn: Optional[SpawnCb] = 
     requested_slots = max(1, job.duration_min // SLOT_MINUTES)
 
     try:
+        # Future reservations cannot be booked until the site's booking window
+        # opens, so jobs may spend a long time sleeping before the poll loop.
         delay = seconds_until_activation(job)
         if delay > 0:
             label = activation_label(job)
@@ -634,8 +683,8 @@ async def run_snipe(job: SnipeJob, notify: NotifyCb, spawn: Optional[SpawnCb] = 
             job.attempts += 1
 
             try:
-                # Fetch all slots for the date (no time filter), then narrow ourselves.
-                # We need other times too to detect consecutive duration runs.
+                # Fetch everything for the date first. Duration-aware snipes need
+                # neighboring time slots to confirm the full requested run exists.
                 all_slots = await _find(job.session, job.date, None, None)
                 if job.count > 1 or job.court:
                     all_slots = _filter_by_court_prefix(all_slots, job.court)
@@ -655,6 +704,7 @@ async def run_snipe(job: SnipeJob, notify: NotifyCb, spawn: Optional[SpawnCb] = 
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
+            # First try to satisfy the user's original ask exactly.
             offer = pick_with_duration(
                 all_slots, job.count, job.same_number, job.partial,
                 job.target_time, requested_slots,
@@ -668,7 +718,8 @@ async def run_snipe(job: SnipeJob, notify: NotifyCb, spawn: Optional[SpawnCb] = 
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
-            # Exact request not available — see if a different configuration is.
+            # If the exact ask is not open, we can still salvage the attempt by
+            # taking the best nearby configuration that the policy allows.
             alt = find_alternative_offer(
                 all_slots, job.count, job.same_number,
                 job.target_time, requested_slots,
