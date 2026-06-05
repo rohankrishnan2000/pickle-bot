@@ -30,4 +30,4 @@ def time_to_id(time_str: str) -> int:
     return TIME_ID_BASE + (minutes - first_slot) // 30
 
 
-x = time_to_id("7:30AM")
+x = time_to_id("12:00PM")

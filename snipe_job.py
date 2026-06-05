@@ -718,18 +718,6 @@ async def run_snipe(job: SnipeJob, notify: NotifyCb, spawn: Optional[SpawnCb] = 
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
-            # If the exact ask is not open, we can still salvage the attempt by
-            # taking the best nearby configuration that the policy allows.
-            alt = find_alternative_offer(
-                all_slots, job.count, job.same_number,
-                job.target_time, requested_slots,
-            )
-            if alt and alt_signature(alt) not in job.rejected_alts:
-                await _offer_alt(job, alt, notify, spawn)
-                if job.status in ("booked", "cancelled"):
-                    return
-                # User skipped or timed out; loop continues waiting for exact match.
-
             if job.attempts % REFRESH_LOGIN_EVERY == 0:
                 await _do_login(job.session, job.email, job.password)
             persist(job)
