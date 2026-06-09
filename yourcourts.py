@@ -13,12 +13,17 @@ The CLI scripts call these helpers directly, and the Telegram bot wraps them in
 async jobs via :mod:`snipe_job`.
 """
 
+import logging
 import os
 import re
 from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 import requests
+
+# Child logger — records flow to the "snipe" root logger configured in snipe_job.
+# Do NOT add handlers here; snipe_job owns the handler setup.
+logger = logging.getLogger("snipe.yourcourts")
 
 BASE_URL = "https://www.yourcourts.com"
 
@@ -177,6 +182,16 @@ def book_slot(session: requests.Session, slot: dict, date: str, duration_min: in
     if not csrf or not owner_id or not start_time_id:
         return False, "Failed to parse reservation form"
 
+    try:
+        logger.info(
+            "book_slot PRE-POST — court=%r time=%r date=%r duration=%d "
+            "reservableResourceId=%r startTimeId=%r",
+            slot.get("court"), slot.get("time"), date, duration_min,
+            slot.get("resource_id"), start_time_id,
+        )
+    except Exception:
+        pass
+
     resp = session.post(
         f"{BASE_URL}/reservation/bookcourtreservation",
         data={
@@ -203,13 +218,35 @@ def book_slot(session: requests.Session, slot: dict, date: str, duration_min: in
     )
 
     if resp.status_code == 302:
+        try:
+            location = resp.headers.get("Location", "")
+            logger.info(
+                "book_slot POST 302 — court=%r time=%r date=%r duration=%d "
+                "status=%d Location=%r",
+                slot.get("court"), slot.get("time"), date, duration_min,
+                resp.status_code, location,
+            )
+        except Exception:
+            pass
         return True, f"Booked {slot['court']} @ {slot['time']} for {duration_min}m on {date}"
 
     alerts = re.findall(r'class="alert[^"]*"[^>]*>(.*?)</div>', resp.text, re.DOTALL)
+    alert_texts: list[str] = []
     for a in alerts:
         clean = re.sub(r"<[^>]+>", "", a).strip()
         if clean:
-            return False, clean
+            alert_texts.append(clean)
+    try:
+        logger.warning(
+            "book_slot POST FAILED — court=%r time=%r date=%r duration=%d "
+            "status=%d alerts=%r",
+            slot.get("court"), slot.get("time"), date, duration_min,
+            resp.status_code, alert_texts,
+        )
+    except Exception:
+        pass
+    if alert_texts:
+        return False, alert_texts[0]
     return False, f"Booking failed (status {resp.status_code})"
 
 
