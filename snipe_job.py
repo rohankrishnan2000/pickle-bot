@@ -923,23 +923,24 @@ async def run_snipe(job: SnipeJob, notify: NotifyCb, spawn: Optional[SpawnCb] = 
                     actions.append((court, ids[target_id + p], n, False))
 
             # 2) Anchor new courts until we hold `count` still-extendable courts.
-            #    A stuck court (next slot opened and got taken) no longer counts
-            #    toward the goal, so we anchor a replacement.
-            viable_held = [c for c in court_progress if not _stuck(c)]
+            #    For drop snipes: a stuck court (next slot opened and was taken by
+            #    someone else) is abandoned so we can anchor a fresh replacement.
+            #    For regular snipes: keep every held court regardless — its later
+            #    slots are already open, so we just keep extending via step 1 as
+            #    cancellations appear, rather than piling up redundant partials.
+            viable_held = [
+                c for c in court_progress
+                if not (is_drop_snipe and _stuck(c))
+            ]
             need_courts = job.count - len(viable_held)
             if need_courts > 0:
                 candidates = {
                     c: ids for c, ids in avail.items()
                     if c not in court_progress and target_id in ids
                 }
-                if not is_drop_snipe:
-                    # Outside the drop-snipe window the booking window is already
-                    # open for all slots, so any missing slot is genuinely taken —
-                    # don't anchor a court unless it has the full run available.
-                    candidates = {
-                        c: ids for c, ids in candidates.items()
-                        if all((target_id + i) in ids for i in range(requested_slots))
-                    }
+                # Anchor any court that has the target slot available and book
+                # the longest contiguous run from there; the extend loop (step 1)
+                # will fill in the rest as slots open or cancellations appear.
                 if candidates:
                     booked_keys = [_court_key(c) for c in court_progress]
                     first_slots = [ids[target_id] for ids in candidates.values()]
