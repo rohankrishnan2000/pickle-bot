@@ -309,6 +309,120 @@ code can inspect the raw `302`. A non-302 means failure, and the code scrapes an
 
 ---
 
+## Part 2b: Looking like a browser (the `User-Agent` and friends)
+
+None of the headers in this section are *authentication* — they don't prove who
+you are. They exist to make the bot's traffic look like it came from a real web
+browser instead of a script. Many sites (including ones behind WAFs/CDNs like
+Cloudflare) inspect these headers and will throttle, challenge, or block requests
+that look automated. So this is **camouflage**, and it sits alongside the real
+auth (the cookie) rather than replacing it.
+
+### What is a `User-Agent`?
+
+The **`User-Agent`** (UA) is a request header in which the client announces what
+it is — browser, version, operating system, rendering engine. A real Chrome on a
+Mac sends exactly this (captured from the HAR):
+
+```
+User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
+```
+
+By default the Python `requests` library sends something like
+`python-requests/2.31.0`. That is a giant flashing sign that says "I am a bot."
+So the very first thing `make_session()` does is overwrite it with the Chrome
+string above:
+
+```python
+# yourcourts.py — make_session()
+session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/148.0.0.0 Safari/537.36"
+    ),
+})
+```
+
+Because this is set on the `requests.Session`, **every** request the bot makes
+inherits it automatically — you set it once, not per call.
+
+### Anatomy of that UA string (it's mostly historical baggage)
+
+The string looks bizarre because of decades of compatibility hacks. Piece by
+piece:
+
+| Token | Meaning |
+|---|---|
+| `Mozilla/5.0` | Legacy prefix every browser still sends, dating back to Netscape. Means nothing today. |
+| `(Macintosh; Intel Mac OS X 10_15_7)` | The OS platform the "browser" claims to run on. |
+| `AppleWebKit/537.36 (KHTML, like Gecko)` | The rendering-engine lineage (WebKit, claiming Gecko compatibility). |
+| `Chrome/148.0.0.0` | The browser and version that actually matters for fingerprinting. |
+| `Safari/537.36` | Another compatibility tail Chrome still includes. |
+
+The practical point: it doesn't need to be *your* real machine — it just needs to
+be a **plausible, current** browser string. The version (`148`) should be kept
+roughly up to date; a UA claiming Chrome 60 would itself look suspicious.
+
+### The modern companions: `Sec-CH-UA` and `Sec-Fetch-*`
+
+A real Chrome sends more than just `User-Agent`. The captured HAR shows these on
+every request:
+
+```
+sec-ch-ua: "Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"
+sec-ch-ua-mobile: ?0
+sec-ch-ua-platform: "macOS"
+sec-fetch-dest: empty
+sec-fetch-mode: cors
+sec-fetch-site: same-origin
+accept-language: en-US,en;q=0.9
+x-requested-with: XMLHttpRequest
+```
+
+- **`Sec-CH-UA` family (User-Agent Client Hints)** — a newer, structured way
+  browsers report themselves: the brand/version list, whether it's mobile
+  (`?0` = no), and the platform. These are meant to gradually replace the messy
+  UA string.
+- **`Sec-Fetch-*` (Fetch Metadata)** — the browser describing the *context* of
+  the request: what kind of resource it's for (`dest`), the mode (`cors`), and
+  whether it originated from the same site (`site: same-origin`). Servers can use
+  these to reject requests that claim to be a browser but have nonsensical fetch
+  metadata.
+- **`X-Requested-With: XMLHttpRequest`** — the conventional marker that a request
+  is an AJAX/background call rather than a top-level page load.
+
+### What this bot does and doesn't bother to send
+
+The bot sets **`User-Agent` globally**, and selectively adds a few request
+headers where they matter — e.g. `list_my_bookings()` sends
+`X-Requested-With: XMLHttpRequest` and `Accept: application/json` because it's
+hitting a JSON endpoint, and `book_slot()` / `cancel_reservation()` set `Origin`
+and `Referer` to mimic submitting from the form page. It does **not** send the
+`Sec-CH-UA` or `Sec-Fetch-*` headers.
+
+That's a deliberate, pragmatic trade-off: yourcourts.com is a small reservation
+site, not a hostile anti-bot fortress, and in practice a believable `User-Agent`
+plus correct `Origin`/`Referer` on the POSTs is enough to be served normally. If
+the site ever started enforcing client hints or fetch-metadata, the fix would be
+to add those headers to `make_session()` — but today they're unnecessary.
+
+### Why UA matters for *every* request, not just login
+
+Some sites serve a successful login but then quietly flag the session if later
+requests come from an inconsistent client. Because the UA lives on the
+`requests.Session`, it stays identical across login, schedule polling, and
+booking — so the whole conversation looks like one coherent browser. Mixing a
+browser UA on login with the default `python-requests` UA afterward would be a
+red flag; using a `Session` avoids that by construction.
+
+> **Note — UA is not security.** A real browser is also free to send any UA it
+> likes; the server can't *trust* it. So the UA never grants access on its own —
+> it only avoids tripping bot heuristics. The actual gatekeeper is always the
+> session cookie from Part 1.
+
+---
+
 ## Part 3: Why you can't see the cookie in the HAR files
 
 If you open the captured `.har` files looking for the cookie, **you won't find
@@ -381,6 +495,18 @@ handles this two ways:
 - **`requests.Session` (client-side)** — the Python object with a cookie jar that
   auto-stores and auto-resends cookies. Created by `make_session()`. Distinct
   from the server session despite the shared name.
+- **`User-Agent`** — a request header announcing the client (browser/OS/version).
+  Camouflage, not auth: `make_session()` overrides the default
+  `python-requests` UA with a real Chrome string so the bot isn't obviously a
+  script. Inherited by every request on the `requests.Session`.
+- **`Sec-CH-UA` / `Sec-Fetch-*`** — modern Chrome fingerprint headers (structured
+  client hints and fetch-context metadata). Real browsers send them; this bot
+  doesn't, and the site doesn't require them.
+- **`X-Requested-With: XMLHttpRequest`** — conventional marker for an AJAX/background
+  request; sent by `list_my_bookings()` against the JSON endpoint.
+- **`Origin` / `Referer`** — headers naming where a request came from; set on the
+  booking and cancel POSTs to mimic a genuine form submission (also an anti-CSRF
+  signal).
 - **CSRF (Cross-Site Request Forgery)** — an attack where another site triggers
   authenticated requests using your auto-sent cookie.
 - **CSRF token / `SYNCHRONIZER_TOKEN`** — an unpredictable per-form value
